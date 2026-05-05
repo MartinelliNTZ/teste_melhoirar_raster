@@ -18,35 +18,38 @@ except ImportError:
     HAS_MAMBA = False
 
 # Parâmetros da Área de Interesse (AOI)
-LATITUDE = -21.19530173974597
-LONGITUDE = -50.46757302669357
-START_DATE = "2024-09-08"
-END_DATE = "2024-09-08"
+LATITUDE = -10.18440098
+LONGITUDE = -48.33361440
+START_DATE = "2025-09-08"
+END_DATE = "2025-09-08"
 IMAGE_INDEX = 0
 
 def main():
-    # 1. Configuração do dispositivo (GPU é recomendada para mamba-ssm)
+    # 1. Configuração do dispositivo (GPU é recomendada)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Usando dispositivo: {device}")
 
-    # No Windows, se o mamba_ssm não estiver instalado, usamos a versão SwinIR (Transformer)
-    # que é compatível e não exige compilação de kernels complexos.
-    model_name = "NonReference_RGBN_x4" if HAS_MAMBA else "NonReference_RGBN_SwinIR_x4"
-    model_url = f"https://huggingface.co/tacofoundation/sen2sr/resolve/main/SEN2SR/{model_name}/mlm.json"
-    
-    # 2. Configuração do Modelo
-    model_dir = f"model/{model_name}"
+    # 2. Seleção do modelo e diretório de download
+    if HAS_MAMBA:
+        model_url = "https://huggingface.co/tacofoundation/sen2sr/resolve/main/SEN2SR/NonReference_RGBN_x4/mlm.json"
+        model_dir = "model/SEN2SR_RGBN"
+        print("Usando arquitetura: Mamba (Full)")
+    else:
+        model_url = "https://huggingface.co/tacofoundation/sen2sr/resolve/main/SEN2SRLite/NonReference_RGBN_x4/mlm.json"
+        model_dir = "model/SEN2SRLite_RGBN"
+        print("Usando arquitetura: SwinIR (Lite)")
+
+    # 3. Download dos pesos do modelo (pula se já existir)
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
 
-    print(f"Usando arquitetura: {'Mamba (Kernel)' if HAS_MAMBA else 'Swin (Transformer)'}")
-    print(f"Verificando/Baixando pesos do modelo {model_name}...")
+    print(f"Verificando/Baixando pesos do modelo em {model_dir}...")
     mlstac.download(
         file=model_url,
         output_dir=model_dir,
     )
 
-    # 3. Criação do cubo de dados Sentinel-2 L2A via cubo
+    # 4. Criação do cubo de dados Sentinel-2 L2A via cubo
     print("Criando cubo de dados Sentinel-2 (B04, B03, B02, B08)...")
     da = cubo.create(
         lat=LATITUDE,
@@ -59,13 +62,13 @@ def main():
         resolution=10
     )
 
-    # 4. Preparação dos dados (Normalização 1/10000)
+    # 5. Preparação dos dados (Normalização 1/10000)
     print("Processando imagem original...")
     original_s2_numpy = (da[IMAGE_INDEX].compute().to_numpy() / 10000).astype("float32")
     X = torch.from_numpy(original_s2_numpy).float().to(device)
     X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # 5. Carregamento e Execução do Modelo
+    # 6. Carregamento e Execução do Modelo
     print("Carregando e compilando o modelo...")
     model = mlstac.load(model_dir).compiled_model(device=device)
 
@@ -74,7 +77,7 @@ def main():
         # Adiciona dimensão de batch e remove após processar
         superX = model(X[None]).squeeze(0)
 
-    # 6. Visualização dos Resultados
+    # 7. Visualização dos Resultados
     print("Gerando comparação visual...")
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
 
