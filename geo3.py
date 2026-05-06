@@ -2,7 +2,14 @@
 """
 SEN2SR - Super-resolução de imagens Sentinel-2 para 2.5m
 Usa um arquivo vetorial (GPKG) como limite da Área de Interesse (AOI).
-Salva a imagem original e a super-resolvida como GeoTIFFs georreferenciados.
+
+Pipeline:
+  1. Lê o polígono do GPKG
+  2. Calcula o cubo grande que cobre toda a bbox (edge_size múltiplo de 128)
+  3. Fatura em tiles 128×128 (com padding se necessário)
+  4. Aplica o modelo SEN2SR em cada tile
+  5. Remonta o mosaico
+  6. Recorta exatamente no formato do polígono
 """
 import os
 import sys
@@ -15,53 +22,38 @@ import cubo
 import matplotlib.pyplot as plt
 import rasterio
 from rasterio.crs import CRS
+from rasterio.features import geometry_mask
+from shapely.ops import unary_union
 
 # =============================================================================
 # CONFIGURAÇÕES (centralizadas no início)
 # =============================================================================
 
-# Caminho do arquivo vetorial com o limite da AOI (polígono ou multipolígono)
 VETOR_LIMITE = "vetores/limite.gpkg"
+START_DATE   = "2024-09-08"
+END_DATE     = "2025-09-08"
+IMAGE_INDEX  = 0
 
-# Dados temporais
-START_DATE = "2024-09-08"
-END_DATE   = "2025-09-08"
-IMAGE_INDEX = 0  # índice da imagem dentro do cubo temporal
-
-# Configuração do cubo Sentinel-2
-COLECAO = "sentinel-2-l2a"
-BANDAS  = ["B04", "B03", "B02", "B08"]  # RGB + NIR
-RESOLUCAO_M = 10   # resolução original Sentinel-2 L2A (metros)
-EDGE_SIZE   = 128  # tamanho do tile (pixels) – usado se bbox não for suportado
-
-# Super-resolução
-FATOR_SUPER_RESOLUCAO = 4   # 10m -> 2.5m
-
-# Saída
-OUTPUT_DIR = "resultados"
-
-# Host do blob Azure para pré-verificação de DNS
-BLOB_HOST = "sentinel2l2a01.blob.core.windows.net"
+COLECAO      = "sentinel-2-l2a"
+BANDAS       = ["B04", "B03", "B02", "B08"]
+RESOLUCAO_M  = 10
+FATOR_SR     = 4        # 10m → 2.5m
+TILE_SIZE    = 128
+OUTPUT_DIR   = "resultados"
+BLOB_HOST    = "sentinel2l2a01.blob.core.windows.net"
 
 # =============================================================================
 # VERIFICAÇÕES DE DEPENDÊNCIAS
 # =============================================================================
 
-# rioxarray (necessário para .rio accessor)
 try:
     import rioxarray  # noqa: F401
 except ImportError:
-    sys.exit("Erro: o pacote 'rioxarray' não está instalado.\n"
-             "Instale-o com: pip install rioxarray")
-
-# geopandas (para ler o GPKG vetorial)
+    sys.exit("pip install rioxarray")
 try:
     import geopandas as gpd
 except ImportError:
-    sys.exit("Erro: o pacote 'geopandas' não está instalado.\n"
-             "Instale-o com: pip install geopandas")
-
-# mamba_ssm (opcional, para arquitetura Mamba Full)
+    sys.exit("pip install geopandas")
 try:
     import mamba_ssm  # noqa: F401
     HAS_MAMBA = True
@@ -72,8 +64,7 @@ except ImportError:
 # FUNÇÕES AUXILIARES
 # =============================================================================
 
-def check_dns_resolution(hostname, timeout=5):
-    """Verifica se um hostname pode ser resolvido via DNS."""
+def check_dns(hostname, timeout=5):
     try:
         socket.setdefaulttimeout(timeout)
         socket.gethostbyname(hostname)
@@ -84,135 +75,59 @@ def check_dns_resolution(hostname, timeout=5):
         socket.setdefaulttimeout(None)
 
 
-def check_internet_connectivity():
-    """Verifica conectividade básica com a internet."""
-    test_hosts = [
-        BLOB_HOST,
-        "google.com",
-        "huggingface.co",
-        "8.8.8.8",
-    ]
-    for host in test_hosts:
-        if check_dns_resolution(host):
-            return True
-    return False
+def check_internet():
+    return any(check_dns(h) for h in [BLOB_HOST, "google.com", "huggingface.co"])
 
 
-def compute_with_retry(da, max_retries=5, base_delay=2.0, backoff=2.0):
-    """
-    Faz o compute de um DataArray com retry para falhas de rede/DNS.
-    """
-    for attempt in range(1, max_retries + 1):
+def compute_with_retry(da, idx=IMAGE_INDEX, max_tries=5, delay=2.0, backoff=2.0):
+    for attempt in range(1, max_tries + 1):
         try:
-            result = da[IMAGE_INDEX].compute().to_numpy()
-            return result
+            return da[idx].compute().to_numpy()
         except Exception as e:
-            error_str = str(e).lower()
-            is_dns = "could not resolve host" in error_str or "resolve" in error_str
-            is_timeout = "timeout" in error_str or "timed out" in error_str
-            is_conn = "connection" in error_str or "econn" in error_str
-
-            if is_dns:
-                print(f"\n  [!] Erro DNS (tentativa {attempt}/{max_retries}): {e}")
-                if attempt == 1:
-                    print("  [!] Verificando conectividade com a internet...")
-                    if not check_internet_connectivity():
-                        print("\n  [!!] SEM CONEXÃO COM A INTERNET.")
-                        print("       Verifique Wi-Fi/cabo, firewall ou proxy.\n")
-                    else:
-                        print("  [!] Internet funciona, mas host do Azure Blob não resolve.")
-                        print("  [!) Possível bloqueio regional ou temporário.\n")
-            elif is_timeout or is_conn:
-                print(f"\n  [!] Erro de rede/Timeout (tentativa {attempt}/{max_retries}): {e}")
+            err = str(e).lower()
+            if ("resolve" in err and "host" in err):
+                print(f"\n  [!] DNS (tentativa {attempt}/{max_tries})")
+                if attempt == 1 and not check_internet():
+                    print("  [!!] SEM INTERNET.")
+            elif "timeout" in err or "connection" in err:
+                print(f"\n  [!] Rede (tentativa {attempt}/{max_tries})")
             else:
-                print(f"\n  [!] Erro inesperado (tentativa {attempt}/{max_retries}): {e}")
-
-            if attempt < max_retries:
-                delay = base_delay * (backoff ** (attempt - 1))
-                print(f"  [~] Aguardando {delay:.1f}s antes de tentar novamente...")
-                time.sleep(delay)
+                print(f"\n  [!] Erro (tentativa {attempt}/{max_tries}): {e}")
+            if attempt < max_tries:
+                d = delay * (backoff ** (attempt - 1))
+                print(f"  [~] Aguardando {d:.0f}s...")
+                time.sleep(d)
             else:
-                print(f"\n  [!!] Todas as {max_retries} tentativas falharam.")
-                print("  [!!] Não foi possível baixar os tiles Sentinel-2.")
-                print("\n  Sugestões:")
-                print("   1. Verifique sua conexão com a internet")
-                print("   2. Desative/ative VPN ou proxy")
-                print("   3. Tente novamente mais tarde")
-                print(f"   4. Teste com: nslookup {BLOB_HOST}\n")
                 raise
 
-    return None
+
+def save_geotiff(arr, transform, crs, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with rasterio.open(path, 'w', driver='GTiff',
+                       height=arr.shape[1], width=arr.shape[2],
+                       count=arr.shape[0], dtype=rasterio.float32,
+                       crs=crs, transform=transform, compress='lzw') as dst:
+        dst.write(arr.astype(rasterio.float32))
 
 
-def save_geotiff(array, transform, crs, filepath, dtype=rasterio.float32):
-    """Salva um array (C, H, W) como GeoTIFF."""
-    count, height, width = array.shape
-    with rasterio.open(
-        filepath, 'w', driver='GTiff',
-        height=height, width=width, count=count,
-        dtype=dtype, crs=crs, transform=transform,
-        compress='lzw'
-    ) as dst:
-        dst.write(array.astype(dtype))
+def pad_to_multiple(arr, tile_size):
+    """Adiciona padding ao array para que H e W sejam múltiplos de tile_size."""
+    _, H, W = arr.shape
+    pad_h = (tile_size - H % tile_size) % tile_size
+    pad_w = (tile_size - W % tile_size) % tile_size
+    if pad_h > 0 or pad_w > 0:
+        arr = np.pad(arr, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant')
+    return arr, pad_h, pad_w
 
 
-def ler_bbox_do_vetorial(caminho_vetor):
-    """
-    Lê um arquivo vetorial (GPKG) e retorna a bounding box
-    no formato (minx, miny, maxx, maxy) em graus decimais (EPSG:4326).
-    """
-    print(f"Lendo vetor: {caminho_vetor}")
-    gdf = gpd.read_file(caminho_vetor)
-
-    if gdf.crs is None:
-        print("  [!] AVISO: O vetor não tem CRS definido. Assumindo EPSG:4326.")
-    elif gdf.crs.to_epsg() != 4326:
-        print(f"  [~] Reprojeteando de {gdf.crs} para EPSG:4326...")
-        gdf = gdf.to_crs("EPSG:4326")
-
-    bbox = gdf.total_bounds  # [minx, miny, maxx, maxy]
-    print(f"  Bounding box (EPSG:4326): {bbox}")
-    return bbox
-
-
-def calcular_centro_e_edge(bbox):
-    """
-    A partir de uma bbox (minx, miny, maxx, maxy) em graus,
-    calcula o ponto central e o edge_size (em pixels) necessário
-    para cobrir a área na resolução desejada.
-    """
-    minx, miny, maxx, maxy = bbox
-    centro_lon = (minx + maxx) / 2.0
-    centro_lat = (miny + maxy) / 2.0
-
-    # largura e altura em graus
-    largura_graus = maxx - minx
-    altura_graus  = maxy - miny
-
-    # converte para metros aproximados (1 grau ~ 111320m no equador)
-    # Para latitude, usamos cos(centro_lat) para ajuste
-    from math import cos, radians
-    fator_lat = cos(radians(centro_lat))
-    largura_m = largura_graus * 111320 * fator_lat
-    altura_m  = altura_graus * 111320
-
-    # edge_size em pixels na resolução desejada (arredondado para cima)
-    edge_largura = int(np.ceil(largura_m / RESOLUCAO_M))
-    edge_altura  = int(np.ceil(altura_m / RESOLUCAO_M))
-    edge_size = max(edge_largura, edge_altura)
-
-    # O modelo SEN2SR espera que edge_size * FATOR_SUPER_RESOLUCAO (4×) seja
-    # um valor suportado internamente (a máscara low-pass tem tamanho fixo).
-    # Forçamos edge_size = 128 para garantir compatibilidade com o modelo.
-    # (Isso cobre ~1.28 km × 1.28 km centrado no ponto de interesse.)
-    edge_size = 128
-
-    print(f"  Centro: ({centro_lat:.6f}, {centro_lon:.6f})")
-    print(f"  Dimensão em graus: {largura_graus:.6f} x {altura_graus:.6f}")
-    print(f"  Dimensão em metros (aprox): {largura_m:.0f} x {altura_m:.0f}")
-    print(f"  Edge size usado: {edge_size} px (fixo para compatibilidade com o modelo)")
-
-    return centro_lat, centro_lon, edge_size
+def clip_to_polygon(arr, transform, geometria):
+    """Aplica máscara: pixels fora do polígono viram NaN."""
+    mask = geometry_mask([geometria], transform=transform, invert=True,
+                         out_shape=(arr.shape[1], arr.shape[2]))
+    masked = arr.copy().astype("float32")
+    for b in range(arr.shape[0]):
+        masked[b][~mask] = np.nan
+    return masked, mask
 
 
 # =============================================================================
@@ -220,30 +135,58 @@ def calcular_centro_e_edge(bbox):
 # =============================================================================
 
 def main():
-    # 0. Pré-verificação de DNS
     print("=" * 60)
-    print("SEN2SR - Super-resolução Sentinel-2")
+    print("SEN2SR - Super-resolução (Tiling adaptativo)")
     print("=" * 60)
 
-    print("\nVerificando conectividade com servidores Sentinel-2...")
-    if not check_dns_resolution(BLOB_HOST):
-        print(f"  [!] DNS NÃO RESOLVE: {BLOB_HOST}")
-        if not check_internet_connectivity():
-            print("  [!!] SEM CONEXÃO COM A INTERNET. Verifique sua rede.\n")
-        else:
-            print("  [~] Internet OK, mas host específico do blob não resolve.\n")
-    else:
-        print(f"  [OK] DNS resolvido: {BLOB_HOST}\n")
+    # Pré-verificação DNS
+    print("\nVerificando conectividade...")
+    if not check_dns(BLOB_HOST) and not check_internet():
+        print("  [!!] SEM INTERNET. Abortando.")
+        return
+    print("  [OK]\n")
 
-    # 0.5 Dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo: {device}\n")
 
-    # 1. Ler o vetor e extrair a bounding box
-    bbox = ler_bbox_do_vetorial(VETOR_LIMITE)
-    centro_lat, centro_lon, edge_size_calc = calcular_centro_e_edge(bbox)
+    # 1. Carregar vetor
+    print(f"Lendo vetor: {VETOR_LIMITE}")
+    gdf = gpd.read_file(VETOR_LIMITE)
+    if gdf.crs is None:
+        gdf.set_crs("EPSG:4326", inplace=True)
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs("EPSG:4326")
+    bbox = gdf.total_bounds  # [minx, miny, maxx, maxy]
+    geometria = unary_union(gdf.geometry.values)
+    print(f"  Bbox: {bbox}\n")
 
-    # 2. Seleção do modelo
+    # 2. Calcular edge_size para cobrir toda a bbox (múltiplo de TILE_SIZE)
+    cy = (bbox[1] + bbox[3]) / 2.0
+    cx = (bbox[0] + bbox[2]) / 2.0
+
+    from math import cos, radians
+    lat_rad = radians(cy)
+    m_per_deg_lon = 111320.0 * cos(lat_rad)
+    m_per_deg_lat = 111320.0
+
+    largura_deg = bbox[2] - bbox[0]
+    altura_deg  = bbox[3] - bbox[1]
+    largura_m = largura_deg * m_per_deg_lon
+    altura_m  = altura_deg  * m_per_deg_lat
+
+    edge_px = int(max(np.ceil(largura_m / RESOLUCAO_M),
+                      np.ceil(altura_m  / RESOLUCAO_M)))
+    # Arredondar para múltiplo de TILE_SIZE
+    edge_px = ((edge_px + TILE_SIZE - 1) // TILE_SIZE) * TILE_SIZE
+    # Mínimo
+    edge_px = max(edge_px, TILE_SIZE)
+
+    ncols = edge_px // TILE_SIZE
+    nrows = edge_px // TILE_SIZE
+    print(f"Área: {largura_m:.0f}m × {altura_m:.0f}m")
+    print(f"Cubo: {edge_px}×{edge_px} px ({ncols}×{nrows} tiles de {TILE_SIZE}px)\n")
+
+    # 3. Seleção do modelo
     if HAS_MAMBA:
         model_url = ("https://huggingface.co/tacofoundation/sen2sr/resolve/main"
                      "/SEN2SR/NonReference_RGBN_x4/mlm.json")
@@ -256,85 +199,149 @@ def main():
         print("Arquitetura: SwinIR (Lite)")
 
     os.makedirs(model_dir, exist_ok=True)
-    print(f"Baixando/verificando pesos do modelo em {model_dir}...")
     mlstac.download(file=model_url, output_dir=model_dir)
-
-    # 3. Cubo Sentinel-2 a partir do vetor
-    print(f"\nCriando cubo Sentinel-2 ({', '.join(BANDAS)})...")
-    print(f"  Período: {START_DATE} a {END_DATE}")
-    print(f"  Resolução: {RESOLUCAO_M}m")
-    print(f"  Edge size: {edge_size_calc} px")
-
-    da = cubo.create(
-        lat=centro_lat,
-        lon=centro_lon,
-        collection=COLECAO,
-        bands=BANDAS,
-        start_date=START_DATE,
-        end_date=END_DATE,
-        edge_size=edge_size_calc,
-        resolution=RESOLUCAO_M,
-    )
-
-    # CRS e transform
-    original_crs = da.rio.crs
-    original_transform = da.rio.transform()
-    print(f"CRS: {original_crs}")
-
-    # 4. Pré-processamento com retry
-    print("Normalizando imagem (com retry em caso de falha de rede)...")
-    original_s2_numpy = compute_with_retry(da)
-    original_s2_numpy = (original_s2_numpy / 10000).astype("float32")
-
-    X = torch.from_numpy(original_s2_numpy).float().to(device)
-    X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # 5. Inferência
-    print("Carregando e compilando o modelo...")
     model = mlstac.load(model_dir).compiled_model(device=device)
 
-    print("Executando super-resolução...")
-    with torch.no_grad():
-        superX = model(X[None]).squeeze(0)
-    super_resolved_numpy = superX.cpu().numpy().astype("float32")
+    # 4. Baixar cubo
+    print(f"\nBaixando cubo S2 ({edge_px}×{edge_px}px, centro {cy:.6f}, {cx:.6f})...")
+    da = cubo.create(lat=cy, lon=cx, collection=COLECAO, bands=BANDAS,
+                     start_date=START_DATE, end_date=END_DATE,
+                     edge_size=edge_px, resolution=RESOLUCAO_M)
 
-    print(f"  Shape original:  {original_s2_numpy.shape}")
-    print(f"  Shape super:     {super_resolved_numpy.shape}")
+    crs = da.rio.crs
+    # Transform do cubo completo (rio já fornece o transform correto)
+    transf_cubo = da.rio.transform()
+    print(f"  CRS: {crs}")
+    print(f"  Transform: {transf_cubo}")
 
-    # 6. Salvamento
+    # CRS geralmente vem como None do cubo, mas os valores do transform
+    # estão em coordenadas UTM (metros). Detectamos o EPSG pela localização.
+    from rasterio.crs import CRS as RioCRS
+    if crs is None:
+        # Para a região de Palmas/TO (lat -10.18, lon -48.33), o UTM zone é 22S
+        # Hemisfério sul = EPSG:32722
+        crs = RioCRS.from_epsg(32722)
+        print(f"  [~] CRS definido manualmente como: {crs}")
+
+    # Reprojetar a geometria do polígono para o CRS do cubo (UTM)
+    print("  [~] Reprojetando polígono para o CRS do cubo...")
+    from shapely.ops import transform as shapely_transform
+    import pyproj
+    project = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
+    geometria_proj = shapely_transform(project, geometria)
+    bbox_proj = geometria_proj.bounds  # [minx, miny, maxx, maxy] em UTM
+
+    # Download
+    cubo_np = compute_with_retry(da)
+    print(f"  Shape: {cubo_np.shape}")
+
+    # Ajustar padding se necessário (deve ser múltiplo, mas garantimos)
+    cubo_np, pad_h, pad_w = pad_to_multiple(cubo_np, TILE_SIZE)
+    if pad_h or pad_w:
+        print(f"  Padding adicionado: {pad_h} linhas, {pad_w} colunas")
+        # O transform não muda — os pixels adicionais ficam fora da área real
+
+    # 5. Fatiar em tiles e processar
+    C, H, W = cubo_np.shape
+    nrows = H // TILE_SIZE
+    ncols = W // TILE_SIZE
+    n_tiles = nrows * ncols
+
+    # Alocar mosaicos
+    mosaico_orig = np.zeros((C, nrows * TILE_SIZE, ncols * TILE_SIZE), dtype="float32")
+    mosaico_sr   = np.zeros((C, nrows * TILE_SIZE * FATOR_SR,
+                                ncols * TILE_SIZE * FATOR_SR), dtype="float32")
+
+    print(f"\nProcessando {n_tiles} tiles ({nrows}×{ncols})...")
+    for r in range(nrows):
+        for c in range(ncols):
+            idx = r * ncols + c + 1
+            h0, h1 = r * TILE_SIZE, (r + 1) * TILE_SIZE
+            w0, w1 = c * TILE_SIZE, (c + 1) * TILE_SIZE
+            print(f"  Tile {idx}/{n_tiles} [{r+1},{c+1}]...", end=" ")
+
+            tile = cubo_np[:, h0:h1, w0:w1]
+            tile_norm = (tile / 10000).astype("float32")
+
+            X = torch.from_numpy(tile_norm).float().to(device)
+            X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+            with torch.no_grad():
+                sr = model(X[None]).squeeze(0)
+            sr_np = sr.cpu().numpy().astype("float32")
+
+            # Inserir nos mosaicos
+            mosaico_orig[:, h0:h1, w0:w1] = tile_norm
+            h0s, h1s = r * TILE_SIZE * FATOR_SR, (r + 1) * TILE_SIZE * FATOR_SR
+            w0s, w1s = c * TILE_SIZE * FATOR_SR, (c + 1) * TILE_SIZE * FATOR_SR
+            mosaico_sr[:, h0s:h1s, w0s:w1s] = sr_np
+            print("OK")
+
+    print("  [OK] Todos os tiles processados!")
+
+    # 6. Aplicar máscara do polígono
+    print("\nAplicando máscara do polígono...")
+
+    # O transform do cubo cobre edge_px x edge_px, centrado em (cx, cy).
+    # O mosaico original tem (nrows*TILE_SIZE) x (ncols*TILE_SIZE) = edge_px x edge_px.
+    # Logo o transform original já está correto para o mosaico.
+    # O canto superior esquerdo do cubo (pixel 0,0) está em:
+    #   transf_cubo * (0, 0) -> (c, f)
+    # Isso já é o que precisamos.
+
+    mosaic_orig_clipped, mask_orig = clip_to_polygon(mosaico_orig, transf_cubo, geometria_proj)
+
+    # Transform para o super-resolvido (resolução 4x maior)
+    # O FATOR_SR multiplica as dimensões, então os pixels são FATOR_SR vezes menores.
+    transf_sr = rasterio.Affine(
+        transf_cubo.a / FATOR_SR,  # resolução x dividida pelo fator
+        transf_cubo.b,
+        transf_cubo.c,
+        transf_cubo.d,
+        transf_cubo.e / FATOR_SR,  # resolução y dividida pelo fator
+        transf_cubo.f,
+    )
+
+    mosaic_sr_clipped, mask_sr = clip_to_polygon(mosaico_sr, transf_sr, geometria_proj)
+
+    # 7. Salvar
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Original 10m
-    original_path = os.path.join(OUTPUT_DIR, "original_10m.tif")
-    save_geotiff(original_s2_numpy, original_transform, original_crs, original_path)
-    print(f"Original salvo em: {original_path}")
+    p_orig = os.path.join(OUTPUT_DIR, "original_10m_mosaic.tif")
+    save_geotiff(mosaic_orig_clipped, transf_cubo, crs, p_orig)
+    print(f"Original: {p_orig}")
 
-    # Super-resolvido 2.5m (transformação ajustada pelo fator)
-    new_transform = rasterio.Affine(
-        original_transform.a / FATOR_SUPER_RESOLUCAO,
-        original_transform.b,
-        original_transform.c,
-        original_transform.d,
-        original_transform.e / FATOR_SUPER_RESOLUCAO,
-        original_transform.f
-    )
-    super_path = os.path.join(OUTPUT_DIR, "super_resolved_2_5m.tif")
-    save_geotiff(super_resolved_numpy, new_transform, original_crs, super_path)
-    print(f"Super-resolvido salvo em: {super_path}")
+    p_sr = os.path.join(OUTPUT_DIR, "super_resolved_2_5m_mosaic.tif")
+    save_geotiff(mosaic_sr_clipped, transf_sr, crs, p_sr)
+    print(f"Super-res.: {p_sr}")
 
-    # 7. Visualização
-    print("Gerando comparação visual...")
+    # 8. Visualização
+    print("\nGerando visualização...")
     fig, axes = plt.subplots(1, 2, figsize=(14, 7))
-    axes[0].imshow(X[[0, 1, 2]].permute(1, 2, 0).cpu().numpy() * 1.5)
-    axes[0].set_title("Sentinel-2 Original (10m)")
-    axes[0].axis('off')
-    axes[1].imshow(superX[[0, 1, 2]].permute(1, 2, 0).cpu().numpy() * 1.5)
-    axes[1].set_title("SEN2SR Super-resolved (2.5m)")
-    axes[1].axis('off')
-    plt.tight_layout()
-    plt.show()
 
-    print("\n[OK] Processamento concluído!")
+    rgb_orig = np.clip(mosaic_orig_clipped[[0, 1, 2]].transpose(1, 2, 0) * 1.5, 0, 1)
+    axes[0].imshow(rgb_orig)
+    axes[0].set_title(f"Original 10m ({nrows}×{ncols} tiles)")
+    axes[0].axis('off')
+
+    rgb_sr = np.clip(mosaic_sr_clipped[[0, 1, 2]].transpose(1, 2, 0) * 1.5, 0, 1)
+    axes[1].imshow(rgb_sr)
+    axes[1].set_title(f"Super-res. 2.5m ({FATOR_SR}×)")
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "comparacao.png"), dpi=150, bbox_inches='tight')
+    print(f"Comparação: {OUTPUT_DIR}/comparacao.png")
+
+    # Estatísticas
+    area_km2_orig = np.sum(mask_orig) * RESOLUCAO_M**2 / 1e6
+    area_km2_sr   = np.sum(mask_sr) * (RESOLUCAO_M / FATOR_SR)**2 / 1e6
+    print(f"\n  Área poligonal: {area_km2_orig:.2f} km² (orig), {area_km2_sr:.2f} km² (sr)")
+    print(f"  Shape orig: {mosaic_orig_clipped.shape}")
+    print(f"  Shape sr:   {mosaic_sr_clipped.shape}")
+
+    plt.show()
+    print("\n[OK] Concluído!")
 
 
 if __name__ == "__main__":
