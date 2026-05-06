@@ -2,3 +2,11 @@ model
 *.tiff
 *.tif
 *.xml
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.gpkg-shm
+*.gpkg-wal

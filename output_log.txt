@@ -1,0 +1,36 @@
+============================================================
+SEN2SR - Super-resolução Sentinel-2
+============================================================
+
+Verificando conectividade com servidores Sentinel-2...
+  [OK] DNS resolvido: sentinel2l2a01.blob.core.windows.net
+
+Dispositivo: cuda
+
+Lendo vetor: vetores/limite.gpkg
+  Bounding box (EPSG:4326): [-48.33799101 -10.1890494  -48.32936487 -10.17993669]
+  Centro: (-10.184493, -48.333678)
+  Dimensão em graus: 0.008626 x 0.009113
+  Dimensão em metros (aprox): 945 x 1014
+  Edge size usado: 128 px (fixo para compatibilidade com o modelo)
+Arquitetura: SwinIR (Lite)
+Baixando/verificando pesos do modelo em model/SEN2SRLite_RGBN...
+Downloading files:   0%|          | 0/4 [00:00<?, ?it/s]Downloading files:  25%|##5       | 1/4 [00:00<00:02,  1.12it/s]Downloading files:  50%|#####     | 2/4 [00:01<00:01,  1.22it/s]Downloading files:  75%|#######5  | 3/4 [00:02<00:00,  1.60it/s]Downloading files: 100%|##########| 4/4 [00:02<00:00,  1.40it/s]Downloading files: 100%|##########| 4/4 [00:02<00:00,  1.38it/s]
+Clipping input data to the valid range for imshow with RGB data ([0..1] for floats or [0..255] for integers). Got range [0.1815..1.1502].
+Clipping input data to the valid range for imshow with RGB data ([0..1] for floats or [0..255] for integers). Got range [0.12645324..1.3405745].
+
+Criando cubo Sentinel-2 (B04, B03, B02, B08)...
+  Período: 2024-09-08 a 2025-09-08
+  Resolução: 10m
+  Edge size: 128 px
+CRS: None
+Normalizando imagem (com retry em caso de falha de rede)...
+Carregando e compilando o modelo...
+Executando super-resolução...
+  Shape original:  (4, 128, 128)
+  Shape super:     (4, 512, 512)
+Original salvo em: resultados\original_10m.tif
+Super-resolvido salvo em: resultados\super_resolved_2_5m.tif
+Gerando comparação visual...
+
+[OK] Processamento concluído!
