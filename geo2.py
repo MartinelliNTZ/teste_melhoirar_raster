@@ -117,6 +117,9 @@ def main():
     save_geotiff(original_s2_numpy, original_transform, original_crs, original_path)
     print(f"Original salvo em: {original_path}")
 
+    # Super-resolvido 2.5m (transformação ajustada)    
+    SCALE_FACTOR = 4    # Fator de super-resolução (4×)  
+
     # Super-resolvido 2.5m (transformação ajustada)
     new_transform = rasterio.Affine(
         original_transform.a / SCALE_FACTOR,
