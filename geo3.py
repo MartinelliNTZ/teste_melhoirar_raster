@@ -304,7 +304,7 @@ def main():
 
     mosaic_sr_clipped, mask_sr = clip_to_polygon(mosaico_sr, transf_sr, geometria_proj)
 
-    # 7. Salvar
+    # 7. Salvar GeoTIFFs originais
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     p_orig = os.path.join(OUTPUT_DIR, "original_10m_mosaic.tif")
@@ -315,19 +315,89 @@ def main():
     save_geotiff(mosaic_sr_clipped, transf_sr, crs, p_sr)
     print(f"Super-res.: {p_sr}")
 
+    # 7.5 Aplicar rio-color (melhoria de cores) no super-resolvido
+    try:
+        from rio_color.operations import simple_atmo, saturation
+        import rio_color.utils as rio_utils
+        print("\nAplicando rio-color (correção atmosférica + saturação)...")
+
+        # Extrair apenas as bandas RGB (B04, B03, B02)
+        rgb_sr = mosaic_sr_clipped[[0, 1, 2]].copy().astype("float32")
+
+        # Guardar máscara de NaN para restaurar depois
+        mask_nan = np.isnan(rgb_sr[0])
+
+        # Substituir NaN por 0 para processamento e normalizar para [0,1]
+        rgb_sr = np.nan_to_num(rgb_sr, nan=0.0)
+        
+        # Normalizar para [0,1] - o modelo pode gerar valores fora desta faixa
+        # Primeiro clamps para [0, max] depois divide pelo max global
+        vmin, vmax = rgb_sr.min(), rgb_sr.max()
+        if vmax > 1.0 or vmin < 0.0:
+            if vmax - vmin > 0.001:
+                rgb_norm = (rgb_sr - vmin) / (vmax - vmin)
+            else:
+                rgb_norm = np.clip(rgb_sr, 0, 1)
+        else:
+            rgb_norm = rgb_sr
+
+        # simple_atmo: correção atmosférica visual
+        #   haze=0.03 (névoa leve), contrast=3 (típico), bias=0.5 (centro)
+        rgb_enhanced = simple_atmo(rgb_norm, haze=0.03, contrast=3, bias=0.5)
+
+        # saturation: aumentar saturação em 30%
+        rgb_enhanced = saturation(rgb_enhanced, proportion=1.3)
+
+        # Desnormalizar de volta para a escala original (opcional)
+        # Mantemos em [0,1] porque é o range correto para visualização
+        rgb_enhanced = np.clip(rgb_enhanced, 0.0, 1.0)
+
+        # Restaurar NaN
+        for b in range(3):
+            rgb_enhanced[b][mask_nan] = np.nan
+
+        # Salvar RGB com cores melhoradas (3 bandas, float32 em [0,1])
+        p_rgb = os.path.join(OUTPUT_DIR, "super_resolved_2_5m_cor.tif")
+        with rasterio.open(p_rgb, 'w', driver='GTiff',
+                           height=rgb_enhanced.shape[1], width=rgb_enhanced.shape[2],
+                           count=3, dtype=rasterio.float32,
+                           crs=crs, transform=transf_sr, compress='lzw') as dst:
+            dst.write(rgb_enhanced.astype(rasterio.float32))
+        print(f"Super-res. corrigido: {p_rgb}")
+
+        # Criar versão 4-bandas (substitui RGB, mantém NIR)
+        mosaic_sr_color = mosaic_sr_clipped.copy()
+        mosaic_sr_color[[0, 1, 2]] = rgb_enhanced
+        p_sr_color = os.path.join(OUTPUT_DIR, "super_resolved_2_5m_color.tif")
+        save_geotiff(mosaic_sr_color, transf_sr, crs, p_sr_color)
+        print(f"Super-res. (4 bandas): {p_sr_color}")
+
+        USAR_COLOR = True
+    except Exception as e:
+        print(f"  [!] Erro ao aplicar rio-color: {e}")
+        import traceback
+        traceback.print_exc()
+        print("  [!] (rio-color está instalado mas houve erro nos dados)")
+        USAR_COLOR = False
+        mosaic_sr_color = mosaic_sr_clipped
+
     # 8. Visualização
     print("\nGerando visualização...")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+    n_panels = 3 if USAR_COLOR else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 7))
 
-    rgb_orig = np.clip(mosaic_orig_clipped[[0, 1, 2]].transpose(1, 2, 0) * 1.5, 0, 1)
-    axes[0].imshow(rgb_orig)
+    axes[0].imshow(np.clip(mosaic_orig_clipped[[0, 1, 2]].transpose(1, 2, 0) * 1.5, 0, 1))
     axes[0].set_title(f"Original 10m ({nrows}×{ncols} tiles)")
     axes[0].axis('off')
 
-    rgb_sr = np.clip(mosaic_sr_clipped[[0, 1, 2]].transpose(1, 2, 0) * 1.5, 0, 1)
-    axes[1].imshow(rgb_sr)
+    axes[1].imshow(np.clip(mosaic_sr_clipped[[0, 1, 2]].transpose(1, 2, 0) * 1.5, 0, 1))
     axes[1].set_title(f"Super-res. 2.5m ({FATOR_SR}×)")
     axes[1].axis('off')
+
+    if USAR_COLOR:
+        axes[2].imshow(np.clip(mosaic_sr_color[[0, 1, 2]].transpose(1, 2, 0), 0, 1))
+        axes[2].set_title(f"Super-res. + rio-color")
+        axes[2].axis('off')
 
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, "comparacao.png"), dpi=150, bbox_inches='tight')
