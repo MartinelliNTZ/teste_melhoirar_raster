@@ -132,16 +132,18 @@ class Swin2SRUpscaler:
         Upscale 2.5x usando bicúbico + refinamento
         
         Args:
-            img_4band: tensor (4, H, W) ou numpy array
+            img_4band: tensor (4, H, W) ou numpy array ou (B, C, H, W)
         Returns:
-            tensor (4, H*2.5, W*2.5)
+            tensor (C, H*2.5, W*2.5) or (B, C, H*2.5, W*2.5)
         """
         if isinstance(img_4band, np.ndarray):
             img_4band = torch.from_numpy(img_4band).float()
         
-        # Garantir 4 dimensões (B, C, H, W)
+        # Track if we add a batch dimension
+        added_batch = False
         if img_4band.dim() == 3:
             img_4band = img_4band.unsqueeze(0)
+            added_batch = True
         
         B, C, H, W = img_4band.shape
         new_H, new_W = int(H * self.scale_factor), int(W * self.scale_factor)
@@ -157,7 +159,7 @@ class Swin2SRUpscaler:
         # Refinamento com rede neural
         img_refined = self.refinement(img_up)
         
-        return img_refined.squeeze(0) if B == 1 else img_refined
+        return img_refined.squeeze(0) if added_batch else img_refined
 
 # =============================================================================
 # FUNÇÕES AUXILIARES
@@ -323,6 +325,10 @@ def process_tile_sr2(tile_4band, model_sr2, device, tile_size_sr=64):
                 sr_subtile = model_sr2.upscale(subtile_tensor)
             
             sr_subtile_np = sr_subtile.cpu().numpy()
+            
+            # Garantir que temos 4D (B, C, H, W)
+            if sr_subtile_np.ndim == 3:
+                sr_subtile_np = sr_subtile_np[np.newaxis, ...]
             
             # Calcular posições no output
             h_out = int(h * FATOR_SR2)
