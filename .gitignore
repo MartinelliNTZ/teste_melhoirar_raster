@@ -10,3 +10,5 @@ model
 *.cpg
 *.gpkg-shm
 *.gpkg-wal
+.venv/
+__pycache__/

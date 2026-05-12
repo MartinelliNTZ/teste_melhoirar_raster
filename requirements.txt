@@ -1,0 +1,13 @@
+torch
+numpy
+mlstac
+cubo
+matplotlib
+rasterio
+shapely
+scipy
+tqdm
+rioxarray
+geopandas
+pyproj
+sen2sr
