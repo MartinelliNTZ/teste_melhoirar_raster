@@ -266,7 +266,7 @@ def process_stage_parallel(input_array, model, device, scale_factor,
         
         # Reconstruir output
         for idx, (h, w, h_end, w_end) in enumerate(batch_positions):
-            sr_tile = sr_tiles[idx][:, :(h_end-h)*scale_factor, :(w_end-w)*scale_factor]
+            sr_tile = sr_tiles[idx][:, :int((h_end-h)*scale_factor), :int((w_end-w)*scale_factor)]
             h_out = int(h * scale_factor)
             w_out = int(w * scale_factor)
             
