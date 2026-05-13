@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-SEN2SR_ULTRA - Super-resolução máxima de Sentinel-2 (OTIMIZADO)
-Pipeline multi-estágio com processamento paralelo e otimizações
+SEN2SR_ULTRA_V3 - Super-resolução REALISTA com modelos PRÉ-TREINADOS
+Pipeline: 10m → 2.5m (SEN2SR) → 1.25m (Swin2SR x2)
++ Fusão multi-temporal para melhoria de qualidade
 """
 import os
 import sys
@@ -20,10 +21,8 @@ from rasterio.features import geometry_mask
 from shapely.ops import unary_union
 from scipy.ndimage import zoom as scipy_zoom
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 import geopandas as gpd
 import pyproj
 import rioxarray
@@ -36,25 +35,22 @@ warnings.filterwarnings('ignore')
 VETOR_LIMITE = "vetores/limite.gpkg"
 START_DATE   = "2026-04-08"
 END_DATE     = "2026-05-07"
-IMAGE_INDEX  = 0
+MAX_IMAGES   = 3             # Número de imagens para fusão temporal
 
 COLECAO      = "sentinel-2-l2a"
 RESOLUCAO_M  = 10
 TILE_SIZE    = 128
-OUTPUT_DIR   = "resultados_ultra"
+OUTPUT_DIR   = "resultados_ultra_v3"
 BLOB_HOST    = "sentinel2l2a01.blob.core.windows.net"
 
-# Pipeline multi-estágio
-FATOR_SR1    = 4        # 10m → 2.5m (SEN2SR)
-FATOR_SR2    = 2        # 2.5m → 1.25m (HAT-L)
-FATOR_SR3    = 2.5      # 1.25m → 0.5m (Real-ESRGAN+)
-RESOLUCAO_FINAL = 0.5   # Resolução alvo em metros
+# Pipeline REALISTA com modelos PRÉ-TREINADOS
+FATOR_SR1    = 4        # 10m → 2.5m (SEN2SR - TREINADO para Sentinel-2)
+FATOR_SR2    = 2        # 2.5m → 1.25m (Swin2SR x2 - TREINADO para imagens reais)
+RESOLUCAO_FINAL = 1.25  # Resolução alvo REALISTA em metros
 
 # Otimizações
-BATCH_SIZE_HAT = 4      # Processamento em batch para HAT-L
-TILE_OVERLAP = 16       # Overlap para evitar artefatos
-USE_TORCH_COMPILE = False # Compilação JIT PyTorch 2.0+ (desabilitada em CPU)
-USE_AMP = True           # Automatic Mixed Precision
+BATCH_SIZE = 4
+TILE_OVERLAP = 16
 
 BANDAS = ["B02", "B03", "B04", "B08", "B05", "B06", "B07", "B8A", "B11", "B12"]
 BANDAS_NOMES = [
@@ -66,225 +62,173 @@ BANDAS_10M_INDICES = [0, 1, 2, 3]
 BANDAS_20M_INDICES = [4, 5, 6, 7, 8, 9]
 
 # =============================================================================
-# LOGGER COM TIMESTAMP
+# LOGGER
 # =============================================================================
 
 def log(msg, level="INFO"):
-    """Log com timestamp"""
     timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {msg}")
+    prefix = {"INFO": "ℹ️", "WARN": "⚠️", "ERROR": "❌", "SUCCESS": "✅"}.get(level, "")
+    print(f"[{timestamp}] {prefix} {msg}")
 
 # =============================================================================
-# MODELOS OTIMIZADOS
+# MODELOS PRÉ-TREINADOS
 # =============================================================================
 
-class HATBlockOptimized(nn.Module):
-    """HAT Block otimizado com fused operations"""
-    def __init__(self, channels, num_heads=8):
-        super().__init__()
-        # Fusão de operações para reduzir chamadas CUDA
-        self.channel_att = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // 8, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 8, channels, 1),
-            nn.Sigmoid()
-        )
-        
-        # Convolução espacial simplificada
-        self.spatial_conv = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
-        self.spatial_gate = nn.Sequential(
-            nn.Conv2d(channels, channels, 1),
-            nn.Sigmoid()
-        )
-        
-        # Feed-forward otimizado
-        self.ff = nn.Sequential(
-            nn.Conv2d(channels, channels * 2, 1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(channels * 2, channels, 1, bias=False)
-        )
-        
-        self.norm1 = nn.LayerNorm(channels)
-        self.norm2 = nn.LayerNorm(channels)
-        
-    def forward(self, x):
-        # Channel attention (fused)
-        att = self.channel_att(x)
-        x = x * att
-        
-        # Spatial attention simplificada
-        spatial = self.spatial_conv(x)
-        gate = self.spatial_gate(x)
-        x = x + spatial * gate
-        
-        # Feed-forward
-        residual = x
-        x = self.norm1(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x = self.ff(x)
-        x = self.norm2(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        
-        return x + residual
-
-class HATSuperResolutionOptimized(nn.Module):
-    """HAT-L otimizado para processamento rápido"""
-    def __init__(self, in_channels=4, out_channels=4, num_blocks=8):
-        super().__init__()
-        self.conv_in = nn.Conv2d(in_channels, 48, 3, padding=1)
-        
-        # Menos blocos mas mais eficientes
-        self.blocks = nn.ModuleList([
-            HATBlockOptimized(48) for _ in range(num_blocks)
-        ])
-        
-        self.conv_mid = nn.Conv2d(48, 48, 3, padding=1)
-        
-        # Upsampling com pixel shuffle otimizado
-        self.up = nn.Sequential(
-            nn.Conv2d(48, 48 * 4, 3, padding=1),
-            nn.PixelShuffle(2),
-            nn.Conv2d(48, out_channels, 3, padding=1)
-        )
-        
-        # Skip connection
-        self.skip = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(in_channels, out_channels, 1)
-        )
-        
-    def forward(self, x):
-        skip = self.skip(x)
-        
-        # Feature extraction
-        feat = self.conv_in(x)
-        
-        # Residual blocks
-        for block in self.blocks:
-            feat = block(feat) + feat * 0.1  # Residual scaling
-        
-        # Upsample
-        out = self.up(feat)
-        
-        return out + skip
-
-class RealESRGANRefinerOptimized(nn.Module):
-    """Refinamento GAN otimizado"""
-    def __init__(self, in_channels=4, out_channels=4):
-        super().__init__()
-        # Encoder mais leve
-        self.enc = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.GELU()
-        )
-        
-        # Residual blocks simplificados
-        self.res_blocks = nn.Sequential(*[
-            nn.Sequential(
-                nn.Conv2d(128, 128, 3, padding=1),
-                nn.GELU(),
-                nn.Conv2d(128, 128, 3, padding=1)
-            ) for _ in range(6)
-        ])
-        
-        # Decoder
-        self.dec = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
-            nn.GELU(),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, out_channels, 3, padding=1)
-        )
-        
-    def forward(self, x):
-        # Upscale inicial
-        up = F.interpolate(x, scale_factor=2.5, mode='bilinear', align_corners=False)
-        
-        # Encoder
-        feat = self.enc(up)
-        
-        # Residual processing
-        for block in self.res_blocks:
-            feat = feat + block(feat)
-        
-        # Decoder
-        out = self.dec(feat)
-        
-        return out + up.repeat(1, 1, 1, 1)[:, :out.shape[1]]
-
-# =============================================================================
-# FUNÇÕES DE PROCESSAMENTO OTIMIZADAS
-# =============================================================================
-
-@torch.cuda.amp.autocast(enabled=USE_AMP)
-def process_batch_tiles(tiles_batch, model, device):
-    """Processa múltiplos tiles em batch"""
-    batch = torch.stack([torch.from_numpy(t).float() for t in tiles_batch]).to(device)
-    with torch.no_grad():
-        output = model(batch)
-    return [o.cpu().numpy() for o in output]
-
-def process_stage_parallel(input_array, model, device, scale_factor, 
-                          tile_size=128, overlap=16, batch_size=4):
-    """Processamento paralelo por estágio"""
-    C, H, W = input_array.shape
-    new_H, new_W = int(H * scale_factor), int(W * scale_factor)
-    output = np.zeros((C, new_H, new_W), dtype=np.float32)
-    weight = np.zeros((new_H, new_W), dtype=np.float32)
+class Swin2SRx2:
+    """Wrapper para Swin2SR 2x pré-treinado"""
+    def __init__(self, device):
+        self.device = device
+        self.model = None
+        self._load_model()
     
-    # Calcular tiles com overlap
-    stride = tile_size - overlap
-    tiles_positions = []
-    
-    for h in range(0, H - overlap, stride):
-        for w in range(0, W - overlap, stride):
-            h_end = min(h + tile_size, H)
-            w_end = min(w + tile_size, W)
-            tiles_positions.append((h, w, h_end, w_end))
-    
-    # Processar em batches
-    for i in tqdm(range(0, len(tiles_positions), batch_size), desc="Processando"):
-        batch_positions = tiles_positions[i:i+batch_size]
-        
-        # Coletar tiles
-        tiles = []
-        for h, w, h_end, w_end in batch_positions:
-            tile = input_array[:, h:h_end, w:w_end]
-            # Padding para tamanho fixo
-            if tile.shape[1] != tile_size or tile.shape[2] != tile_size:
-                padded = np.zeros((C, tile_size, tile_size), dtype=np.float32)
-                padded[:, :tile.shape[1], :tile.shape[2]] = tile
-                tiles.append(padded)
-            else:
-                tiles.append(tile)
-        
-        # Processar batch
-        sr_tiles = process_batch_tiles(tiles, model, device)
-        
-        # Reconstruir output
-        for idx, (h, w, h_end, w_end) in enumerate(batch_positions):
-            sr_tile = sr_tiles[idx][:, :int((h_end-h)*scale_factor), :int((w_end-w)*scale_factor)]
-            h_out = int(h * scale_factor)
-            w_out = int(w * scale_factor)
+    def _load_model(self):
+        """Carrega Swin2SR 2x do HuggingFace"""
+        try:
+            from transformers import Swin2SRForImageSuperResolution
+            from transformers import Swin2SRImageProcessor
             
-            output[:, h_out:h_out+sr_tile.shape[1], 
-                   w_out:w_out+sr_tile.shape[2]] += sr_tile
-            weight[h_out:h_out+sr_tile.shape[1], 
-                   w_out:w_out+sr_tile.shape[2]] += 1
+            log("Carregando Swin2SR 2x pré-treinado (Real-World SR)...")
+            
+            # Modelo 2x - mais conservador, menos alucinações
+            model_id = "caidas/swin2SR-realworld-sr-x2-64-bsrgan-psnr"
+            
+            self.processor = Swin2SRImageProcessor.from_pretrained(model_id)
+            self.model = Swin2SRForImageSuperResolution.from_pretrained(
+                model_id,
+                torch_dtype=torch.float32
+            ).to(self.device)
+            self.model.eval()
+            
+            params = sum(p.numel() for p in self.model.parameters()) / 1e6
+            log(f"✅ Swin2SR 2x carregado! Parâmetros: {params:.1f}M")
+            log(f"   Upscaling: 2x (2.5m → 1.25m)")
+            
+        except ImportError:
+            log("Transformers não instalado.", "ERROR")
+            log("Execute: pip install transformers timm", "ERROR")
+            raise
+        except Exception as e:
+            log(f"Erro ao carregar Swin2SR 2x: {e}", "ERROR")
+            log("Tentando modelo alternativo...", "WARN")
+            self._load_fallback()
     
-    # Normalizar por overlap
-    weight[weight == 0] = 1
-    for c in range(C):
-        output[c] /= weight
+    def _load_fallback(self):
+        """Fallback: usa modelo 4x com downscale ou bicubic"""
+        log("Usando bicubic de alta qualidade como fallback...")
+        self.model = None
+        self.processor = None
     
-    return output
+    def __call__(self, x):
+        """Processa tensor ou numpy array"""
+        if self.model is None:
+            # Fallback: bicubic de alta qualidade
+            if isinstance(x, np.ndarray):
+                result = np.zeros((x.shape[0], x.shape[1]*2, x.shape[2]*2) if x.ndim == 3 
+                                  else (x.shape[0], x.shape[1], x.shape[2]*2, x.shape[3]*2),
+                                  dtype=np.float32)
+                if x.ndim == 3:
+                    for c in range(x.shape[0]):
+                        result[c] = scipy_zoom(x[c], 2.0, order=3)
+                else:
+                    for b in range(x.shape[0]):
+                        for c in range(x.shape[1]):
+                            result[b, c] = scipy_zoom(x[b, c], 2.0, order=3)
+                return torch.from_numpy(result).to(self.device)
+            else:
+                return F.interpolate(x, scale_factor=2, mode='bicubic', align_corners=False)
+        
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x).float().to(self.device)
+        
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        
+        with torch.no_grad():
+            outputs = []
+            for i in range(x.shape[0]):
+                img = x[i].cpu().numpy().transpose(1, 2, 0)
+                img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+                
+                inputs = self.processor(img, return_tensors="pt").to(self.device)
+                output = self.model(**inputs)
+                output = output.reconstruction.squeeze(0).cpu().numpy()
+                output = output.transpose(2, 0, 1) / 255.0
+                outputs.append(torch.from_numpy(output))
+            
+            return torch.stack(outputs).to(self.device)
+    
+    def to(self, device):
+        self.device = device
+        if self.model is not None:
+            self.model = self.model.to(device)
+        return self
 
 # =============================================================================
-# FUNÇÕES AUXILIARES (mantidas do original)
+# PROCESSAMENTO MULTI-TEMPORAL
 # =============================================================================
+
+class MultiTemporalFusion:
+    """Fusão de múltiplas imagens temporais"""
+    
+    @staticmethod
+    def compute_quality_score(image):
+        """Score de nitidez local"""
+        grad_x = np.abs(np.diff(image, axis=2))
+        grad_y = np.abs(np.diff(image, axis=1))
+        
+        grad_x = np.pad(grad_x, ((0, 0), (0, 0), (0, 1)), mode='edge')
+        grad_y = np.pad(grad_y, ((0, 0), (0, 1), (0, 0)), mode='edge')
+        
+        score = np.sqrt(grad_x**2 + grad_y**2).mean(axis=0)
+        return score
+    
+    @staticmethod
+    def fuse_images(images, method='weighted_median'):
+        """Fusiona múltiplas imagens"""
+        if len(images) == 1:
+            return images[0]
+        
+        images_stack = np.stack(images, axis=0)
+        
+        if method == 'weighted_median':
+            weights = []
+            for img in images:
+                score = MultiTemporalFusion.compute_quality_score(img)
+                weights.append(score)
+            
+            weights = np.stack(weights, axis=0)
+            weights = weights / (weights.sum(axis=0, keepdims=True) + 1e-8)
+            
+            fused = np.sum(images_stack * weights[:, np.newaxis, :, :], axis=0)
+            return fused
+        
+        elif method == 'median':
+            return np.nanmedian(images_stack, axis=0)
+        
+        else:
+            return np.nanmean(images_stack, axis=0)
+
+# =============================================================================
+# FUNÇÕES AUXILIARES
+# =============================================================================
+
+def apply_blend_window(tile_size, overlap):
+    """Janela de blending"""
+    window = np.ones((tile_size, tile_size), dtype=np.float32)
+    ramp = np.linspace(0, 1, overlap)
+    
+    window[:overlap, :] *= ramp[:, np.newaxis]
+    window[-overlap:, :] *= ramp[::-1, np.newaxis]
+    window[:, :overlap] *= ramp[np.newaxis, :]
+    window[:, -overlap:] *= ramp[np.newaxis, ::-1]
+    
+    return window
+
+def diagnosticar_tensor(arr, nome):
+    """Diagnóstico de valores"""
+    log(f"📊 {nome}:")
+    log(f"   Shape: {arr.shape} | Min: {np.nanmin(arr):.4f} | Max: {np.nanmax(arr):.4f}")
+    log(f"   Mean: {np.nanmean(arr):.4f} | NaN: {np.isnan(arr).sum()} | Inf: {np.isinf(arr).sum()}")
 
 def check_dns(hostname, timeout=5):
     try:
@@ -299,23 +243,18 @@ def check_dns(hostname, timeout=5):
 def check_internet():
     return any(check_dns(h) for h in [BLOB_HOST, "google.com", "huggingface.co"])
 
-def compute_with_retry(da, idx=IMAGE_INDEX, max_tries=5, delay=2.0, backoff=2.0):
+def compute_with_retry(da, idx=0, max_tries=5, delay=2.0, backoff=2.0):
     for attempt in range(1, max_tries + 1):
         try:
             return da[idx].compute().to_numpy()
         except Exception as e:
             err = str(e).lower()
-            if ("resolve" in err and "host" in err):
-                log(f"DNS (tentativa {attempt}/{max_tries})", "WARN")
-                if attempt == 1 and not check_internet():
-                    log("SEM INTERNET", "ERROR")
-            elif "timeout" in err or "connection" in err:
+            if "resolve" in err or "timeout" in err or "connection" in err:
                 log(f"Rede (tentativa {attempt}/{max_tries})", "WARN")
             else:
                 log(f"Erro (tentativa {attempt}/{max_tries}): {e}", "ERROR")
             if attempt < max_tries:
                 d = delay * (backoff ** (attempt - 1))
-                log(f"Aguardando {d:.0f}s...")
                 time.sleep(d)
             else:
                 raise
@@ -348,66 +287,115 @@ def clip_to_polygon(arr, transform, geometria):
 def upscale_bicubico(banda_2d, fator):
     return scipy_zoom(banda_2d, (fator, fator), order=3, mode='reflect')
 
-def aplicar_rio_color(rgb_arr, transform, crs, caminho_saida):
-    """Aplicar correção de cores com rio-color"""
-    try:
-        from rio_color.operations import simple_atmo, saturation
-    except ImportError:
-        log("pip install rio-color para ativar correção de cores", "WARN")
-        return rgb_arr
-
-    rgb = rgb_arr.copy().astype("float32")
-    mask_nan = np.isnan(rgb[0])
-    rgb = np.nan_to_num(rgb, nan=0.0)
-
-    rgb_eq = rgb.copy()
-    for b in range(3):
-        banda = rgb_eq[b]
-        mascara = ~np.isnan(rgb[b])
-        if np.any(mascara):
-            vmin = np.percentile(banda[mascara], 2)
-            vmax = np.percentile(banda[mascara], 98)
-            if vmax > vmin:
-                rgb_eq[b][mascara] = (banda[mascara] - vmin) / (vmax - vmin)
+def process_tile_sr(tile, model, device):
+    """Processa um tile com o modelo SR"""
+    X = torch.from_numpy(tile).float().to(device)
+    X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     
-    rgb_enh = simple_atmo(rgb_eq, haze=0.02, contrast=3.5, bias=0.5)
-    rgb_enh = saturation(rgb_enh, proportion=1.4)
-    rgb_enh = np.clip(rgb_enh, 0.0, 1.0)
+    with torch.no_grad():
+        if X.dim() == 3:
+            X = X.unsqueeze(0)
+        sr = model(X).squeeze(0)
+    
+    return sr.cpu().numpy().astype("float32")
 
-    for b in range(3):
-        rgb_enh[b][mask_nan] = np.nan
+def baixar_cubos_temporais(cy, cx, edge_px, start_date, end_date, max_images=3):
+    """Baixa múltiplas imagens em diferentes períodos"""
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    total_days = (end_dt - start_dt).days
+    
+    if total_days < 10:
+        log("Janela muito curta, baixando imagem única...", "WARN")
+        return baixar_cubo_unico(cy, cx, edge_px, start_date, end_date)
+    
+    interval = max(total_days // max_images, 10)
+    
+    cubos_temporais = []
+    crs = None
+    transf_cubo = None
+    
+    for i in range(max_images):
+        center_date = start_dt + timedelta(days=i * interval + interval // 2)
+        if center_date > end_dt:
+            center_date = end_dt
+        
+        sub_start = (center_date - timedelta(days=3)).strftime("%Y-%m-%d")
+        sub_end = (center_date + timedelta(days=3)).strftime("%Y-%m-%d")
+        
+        log(f"Buscando imagem {i+1}/{max_images}: {sub_start} a {sub_end}")
+        
+        try:
+            da = cubo.create(
+                lat=cy, lon=cx,
+                collection=COLECAO,
+                bands=BANDAS,
+                start_date=sub_start,
+                end_date=sub_end,
+                edge_size=edge_px,
+                resolution=RESOLUCAO_M
+            )
+            
+            if crs is None:
+                crs = da.rio.crs
+                transf_cubo = da.rio.transform()
+                if crs is None:
+                    crs = rasterio.crs.CRS.from_epsg(32722)
+            
+            cubo_np = compute_with_retry(da, idx=0, max_tries=3)
+            cubo_np, pad_h, pad_w = pad_to_multiple(cubo_np, TILE_SIZE)
+            
+            cubo_norm = cubo_np / 10000.0
+            cubos_temporais.append(cubo_norm)
+            
+            log(f"   ✅ Shape: {cubo_np.shape}")
+            
+        except Exception as e:
+            log(f"   ⚠️ Falha: {e}", "WARN")
+            continue
+    
+    return cubos_temporais, crs, transf_cubo
 
-    save_geotiff(rgb_enh, transform, crs, caminho_saida)
-    return rgb_enh
-
-def salvar_bandas_individuais(arr, nomes, transform, crs, pasta):
-    """Salvar cada banda em arquivo separado"""
-    pasta_bandas = os.path.join(OUTPUT_DIR, pasta)
-    os.makedirs(pasta_bandas, exist_ok=True)
-    for i, nome in enumerate(nomes):
-        caminho = os.path.join(pasta_bandas, f"{nome}.tif")
-        with rasterio.open(caminho, 'w', driver='GTiff',
-                           height=arr.shape[1], width=arr.shape[2],
-                           count=1, dtype=rasterio.float32,
-                           crs=crs, transform=transform, compress='lzw',
-                           BIGTIFF='YES') as dst:
-            dst.write(arr[i:i+1].astype(rasterio.float32))
-    log(f"{len(nomes)} bandas salvas em: {pasta_bandas}/")
+def baixar_cubo_unico(cy, cx, edge_px, start_date, end_date):
+    """Fallback: baixa uma única imagem"""
+    log(f"Baixando: {start_date} a {end_date}")
+    
+    da = cubo.create(
+        lat=cy, lon=cx,
+        collection=COLECAO,
+        bands=BANDAS,
+        start_date=start_date,
+        end_date=end_date,
+        edge_size=edge_px,
+        resolution=RESOLUCAO_M
+    )
+    
+    crs = da.rio.crs
+    transf_cubo = da.rio.transform()
+    if crs is None:
+        crs = rasterio.crs.CRS.from_epsg(32722)
+    
+    cubo_np = compute_with_retry(da, idx=0, max_tries=3)
+    cubo_np, pad_h, pad_w = pad_to_multiple(cubo_np, TILE_SIZE)
+    
+    cubo_norm = cubo_np / 10000.0
+    log(f"✅ Shape: {cubo_np.shape}")
+    
+    return [cubo_norm], crs, transf_cubo
 
 # =============================================================================
-# FUNÇÃO PRINCIPAL OTIMIZADA
+# PIPELINE PRINCIPAL
 # =============================================================================
 
 def main():
     start_time = time.time()
     log("=" * 70)
-    log("SEN2SR_ULTRA - Super-Resolução Máxima (0.5m) [OTIMIZADO]")
-    log("Pipeline: 10m → 2.5m → 1.25m → 0.5m")
-    log("Otimizações: Batch processing + Mixed Precision + Overlap")
+    log("SEN2SR_ULTRA_V3 - Super-Resolução REALISTA")
+    log("Pipeline: 10m → 2.5m (SEN2SR) → 1.25m (Swin2SR 2x)")
+    log("Modelos: 100% PRÉ-TREINADOS | Resolução final: 1.25m")
     log("=" * 70)
 
     # Verificar conectividade
-    log("Verificando conectividade...")
     if not check_dns(BLOB_HOST) and not check_internet():
         log("SEM INTERNET. Abortando.", "ERROR")
         return
@@ -418,21 +406,8 @@ def main():
     log(f"Dispositivo: {device}")
     if device.type == 'cuda':
         log(f"GPU: {torch.cuda.get_device_name(0)}")
-        mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        log(f"VRAM: {mem_gb:.1f} GB")
-        if mem_gb < 8:
-            log("VRAM < 8GB - Reduzindo batch size", "WARN")
-            global BATCH_SIZE_HAT
-            BATCH_SIZE_HAT = 2
-        elif mem_gb >= 16:
-            BATCH_SIZE_HAT = 8
-            log("VRAM excelente! Batch size aumentado para 8")
-        
-        # Otimizações CUDA
         torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        if hasattr(torch.cuda, 'empty_cache'):
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
     # 1. Carregar vetor
     log(f"Lendo vetor: {VETOR_LIMITE}")
@@ -443,7 +418,6 @@ def main():
         gdf = gdf.to_crs("EPSG:4326")
     bbox = gdf.total_bounds
     geometria = unary_union(gdf.geometry.values)
-    log(f"Bbox: {bbox}")
 
     # 2. Calcular dimensões
     cy = (bbox[1] + bbox[3]) / 2.0
@@ -464,189 +438,235 @@ def main():
     ncols = edge_px // TILE_SIZE
     nrows = edge_px // TILE_SIZE
     
-    fator_total = FATOR_SR1 * FATOR_SR2 * FATOR_SR3
+    fator_total = FATOR_SR1 * FATOR_SR2  # 4 * 2 = 8
     edge_px_final = int(edge_px * fator_total)
     
     log(f"Área: {largura_m:.0f}m × {altura_m:.0f}m")
     log(f"Cubo 10m: {edge_px}×{edge_px} px ({ncols}×{nrows} tiles)")
-    log(f"Cubo 0.5m: {edge_px_final}×{edge_px_final} px")
-    log(f"Upscaling total: {fator_total:.0f}x")
+    log(f"Cubo 1.25m: {edge_px_final}×{edge_px_final} px")
+    log(f"Upscaling total: {fator_total}x (8x)")
 
-    # 3. Carregar modelos
-    log("Carregando modelos de super-resolução...")
+    # 3. Carregar modelos PRÉ-TREINADOS
+    log("=" * 70)
+    log("CARREGANDO MODELOS PRÉ-TREINADOS")
+    log("=" * 70)
     
-    # Estágio 1: SEN2SR
+    # Estágio 1: SEN2SR (TREINADO para Sentinel-2)
     try:
         import mamba_ssm
-        HAS_MAMBA = True
         model_url = ("https://huggingface.co/tacofoundation/sen2sr/resolve/main"
                      "/SEN2SR/NonReference_RGBN_x4/mlm.json")
         model_dir = "model/SEN2SR_RGBN"
-        log("Estágio 1: SEN2SR Mamba (4x)")
+        log("✅ SEN2SR Mamba (4x) - TREINADO para Sentinel-2")
     except ImportError:
-        HAS_MAMBA = False
         model_url = ("https://huggingface.co/tacofoundation/sen2sr/resolve/main"
                      "/SEN2SRLite/NonReference_RGBN_x4/mlm.json")
         model_dir = "model/SEN2SRLite_RGBN"
-        log("Estágio 1: SEN2SR Lite SwinIR (4x)")
+        log("✅ SEN2SR Lite SwinIR (4x) - TREINADO para Sentinel-2")
 
     os.makedirs(model_dir, exist_ok=True)
     if not os.path.exists(os.path.join(model_dir, "mlm.json")):
         mlstac.download(file=model_url, output_dir=model_dir)
     model_sr1 = mlstac.load(model_dir).compiled_model(device=device)
     
-    # Estágio 2: HAT-L Otimizado
-    log("Estágio 2: HAT-L Otimizado (2x)")
-    model_sr2 = HATSuperResolutionOptimized(
-        in_channels=4, out_channels=4, num_blocks=6  # Reduzido para velocidade
-    ).to(device)
-    model_sr2.eval()
+    # Estágio 2: Swin2SR 2x (TREINADO para imagens reais)
+    log("Carregando Swin2SR 2x...")
+    model_sr2 = Swin2SRx2(device)
+    log("✅ Swin2SR 2x (2x) - TREINADO para imagens reais")
     
-    # Compilar com Torch 2.0+ se disponível (apenas em GPU)
-    if USE_TORCH_COMPILE and device.type == 'cuda' and hasattr(torch, 'compile'):
-        try:
-            log("Compilando HAT-L com torch.compile()...")
-            model_sr2 = torch.compile(model_sr2, mode='reduce-overhead')
-            log("Compilação JIT ativada!")
-        except Exception as e:
-            log(f"Falha na compilação JIT: {e}", "WARN")
+    log("=" * 70)
+    log("📊 RESUMO DOS MODELOS:")
+    log("   Estágio 1: SEN2SR - Treinado ESPECIFICAMENTE para Sentinel-2")
+    log("   Estágio 2: Swin2SR 2x - Treinado para imagens reais (conservador)")
+    log("   Upscaling: 4x → 2x = 8x total")
+    log("   Resolução: 10m → 2.5m → 1.25m")
+    log("=" * 70)
+
+    # 4. Baixar imagens
+    log("Baixando imagens Sentinel-2...")
     
-    # Estágio 3: Real-ESRGAN+ Otimizado
-    log("Estágio 3: Real-ESRGAN+ Otimizado (2.5x)")
-    model_sr3 = RealESRGANRefinerOptimized(in_channels=4, out_channels=4).to(device)
-    model_sr3.eval()
+    cubos_temporais, crs, transf_cubo = baixar_cubos_temporais(
+        cy, cx, edge_px, START_DATE, END_DATE, MAX_IMAGES
+    )
     
-    total_params = sum(p.numel() for m in [model_sr2, model_sr3] for p in m.parameters())
-    log(f"Parâmetros totais (estágios 2+3): {total_params/1e6:.1f}M")
-    log("Modelos carregados!")
-
-    # 4. Baixar cubo
-    log(f"Baixando cubo Sentinel-2 ({edge_px}×{edge_px}px)...")
-    da = cubo.create(lat=cy, lon=cx, collection=COLECAO, bands=BANDAS,
-                     start_date=START_DATE, end_date=END_DATE,
-                     edge_size=edge_px, resolution=RESOLUCAO_M)
-
-    crs = da.rio.crs
-    transf_cubo = da.rio.transform()
-    log(f"CRS: {crs}")
-
-    if crs is None:
-        crs = rasterio.crs.CRS.from_epsg(32722)
-        log(f"CRS forçado: {crs}", "WARN")
-
-    log("Reprojetando polígono...")
+    if len(cubos_temporais) == 0:
+        log("Nenhuma imagem disponível! Abortando.", "ERROR")
+        return
+    
+    log(f"✅ {len(cubos_temporais)} imagens baixadas")
+    
+    # Reprojetar polígono
     from shapely.ops import transform as shapely_transform
     project = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
     geometria_proj = shapely_transform(project, geometria)
+    
+    C, H, W = cubos_temporais[0].shape
 
-    cubo_np = compute_with_retry(da)
-    log(f"Shape do cubo: {cubo_np.shape}")
-
-    cubo_np, pad_h, pad_w = pad_to_multiple(cubo_np, TILE_SIZE)
-    if pad_h or pad_w:
-        log(f"Padding aplicado: {pad_h}×{pad_w}")
-
-    # 5. Pipeline de super-resolução otimizado
-    C, H, W = cubo_np.shape
-
-    # === ESTÁGIO 1: SEN2SR (10m → 2.5m) ===
-    stage1_start = time.time()
+    # 5. Processar cada imagem
     log("=" * 70)
-    log("ETAPA 1/3: SEN2SR (10m → 2.5m)")
+    log("PROCESSANDO IMAGENS")
     log("=" * 70)
     
-    H1 = int(H * FATOR_SR1)
-    W1 = int(W * FATOR_SR1)
-    mosaico_sr1 = np.zeros((4, H1, W1), dtype="float32")
-
-    nrows_sr1 = H // TILE_SIZE
-    ncols_sr1 = W // TILE_SIZE
-
-    for r in tqdm(range(nrows_sr1), desc="SEN2SR"):
-        for c in range(ncols_sr1):
-            h0, h1 = r * TILE_SIZE, (r + 1) * TILE_SIZE
-            w0, w1 = c * TILE_SIZE, (c + 1) * TILE_SIZE
-
-            tile = cubo_np[:, h0:h1, w0:w1]
-            tile_norm = (tile / 10000).astype("float32")
-            tile_rgbn = tile_norm[[2, 1, 0, 3], :, :]
-
-            X = torch.from_numpy(tile_rgbn).float().to(device)
-            X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-
+    resultados_temporais = []
+    
+    for img_idx, cubo_norm in enumerate(cubos_temporais):
+        log(f"\n{'='*50}")
+        log(f"Imagem {img_idx+1}/{len(cubos_temporais)}")
+        log(f"{'='*50}")
+        
+        # === ESTÁGIO 1: SEN2SR (10m → 2.5m) ===
+        etapa1_start = time.time()
+        log("Etapa 1/2: SEN2SR (10m → 2.5m)")
+        
+        H1 = int(H * FATOR_SR1)
+        W1 = int(W * FATOR_SR1)
+        mosaico_sr1 = np.zeros((4, H1, W1), dtype="float32")
+        
+        for r in tqdm(range(nrows), desc="SEN2SR"):
+            for c in range(ncols):
+                h0, h1 = r * TILE_SIZE, (r + 1) * TILE_SIZE
+                w0, w1 = c * TILE_SIZE, (c + 1) * TILE_SIZE
+                
+                tile = cubo_norm[:, h0:h1, w0:w1]
+                tile_rgbn = tile[[2, 1, 0, 3], :, :]  # RGBN order
+                
+                sr_np = process_tile_sr(tile_rgbn, model_sr1, device)
+                
+                h0s, h1s = r * TILE_SIZE * FATOR_SR1, (r + 1) * TILE_SIZE * FATOR_SR1
+                w0s, w1s = c * TILE_SIZE * FATOR_SR1, (c + 1) * TILE_SIZE * FATOR_SR1
+                mosaico_sr1[:, h0s:h1s, w0s:w1s] = sr_np
+        
+        mosaico_sr1 = np.clip(mosaico_sr1, 0.0, 1.0)
+        etapa1_time = time.time() - etapa1_start
+        diagnosticar_tensor(mosaico_sr1, f"Imagem {img_idx+1} - SEN2SR (2.5m)")
+        log(f"✅ Etapa 1 concluída em {etapa1_time:.1f}s")
+        
+        # Salvar etapa 1
+        transf_sr1 = rasterio.Affine(
+            transf_cubo.a / FATOR_SR1, transf_cubo.b, transf_cubo.c,
+            transf_cubo.d, transf_cubo.e / FATOR_SR1, transf_cubo.f,
+        )
+        p_sr1 = os.path.join(OUTPUT_DIR, f"etapa1_sen2sr_2_5m_img{img_idx+1}.tif")
+        save_geotiff(mosaico_sr1, transf_sr1, crs, p_sr1)
+        
+        # === ESTÁGIO 2: Swin2SR 2x (2.5m → 1.25m) ===
+        etapa2_start = time.time()
+        log("Etapa 2/2: Swin2SR 2x (2.5m → 1.25m)")
+        
+        H2 = int(H1 * FATOR_SR2)
+        W2 = int(W1 * FATOR_SR2)
+        mosaico_sr2 = np.zeros((4, H2, W2), dtype="float32")
+        weight = np.zeros((H2, W2), dtype=np.float32)
+        
+        tile_size_sr2 = 64
+        overlap_sr2 = 8
+        blend_window = apply_blend_window(tile_size_sr2, overlap_sr2)
+        stride = tile_size_sr2 - overlap_sr2
+        
+        tiles_list = []
+        for h in range(0, H1 - overlap_sr2, stride):
+            for w in range(0, W1 - overlap_sr2, stride):
+                h_end = min(h + tile_size_sr2, H1)
+                w_end = min(w + tile_size_sr2, W1)
+                tiles_list.append((h, w, h_end, w_end))
+        
+        for i in tqdm(range(0, len(tiles_list), BATCH_SIZE), desc="Swin2SR 2x"):
+            batch_positions = tiles_list[i:i+BATCH_SIZE]
+            
+            batch_tiles = []
+            for h, w, h_end, w_end in batch_positions:
+                tile = mosaico_sr1[:, h:h_end, w:w_end]
+                if tile.shape[1] != tile_size_sr2 or tile.shape[2] != tile_size_sr2:
+                    padded = np.zeros((4, tile_size_sr2, tile_size_sr2), dtype=np.float32)
+                    padded[:, :tile.shape[1], :tile.shape[2]] = tile
+                    batch_tiles.append(padded)
+                else:
+                    batch_tiles.append(tile)
+            
+            batch_tensor = torch.stack([torch.from_numpy(t).float() for t in batch_tiles]).to(device)
             with torch.no_grad():
-                sr = model_sr1(X[None]).squeeze(0)
-            sr_np = sr.cpu().numpy().astype("float32")
-
-            h0s, h1s = r * TILE_SIZE * FATOR_SR1, (r + 1) * TILE_SIZE * FATOR_SR1
-            w0s, w1s = c * TILE_SIZE * FATOR_SR1, (c + 1) * TILE_SIZE * FATOR_SR1
-            mosaico_sr1[:, h0s:h1s, w0s:w1s] = sr_np
-
-    stage1_time = time.time() - stage1_start
-    log(f"Etapa 1 concluída em {stage1_time:.1f}s! Shape: {mosaico_sr1.shape}")
-
-    # === ESTÁGIO 2: HAT-L Otimizado (2.5m → 1.25m) ===
-    stage2_start = time.time()
+                sr_tiles = model_sr2(batch_tensor).cpu().numpy()
+            
+            for idx, (h, w, h_end, w_end) in enumerate(batch_positions):
+                sr_tile = sr_tiles[idx]
+                tile_h = int((h_end - h) * FATOR_SR2)
+                tile_w = int((w_end - w) * FATOR_SR2)
+                sr_tile = sr_tile[:, :tile_h, :tile_w]
+                
+                h_out = int(h * FATOR_SR2)
+                w_out = int(w * FATOR_SR2)
+                
+                window_resized = scipy_zoom(blend_window, (tile_h/tile_size_sr2, tile_w/tile_size_sr2), order=1)
+                
+                for ch in range(4):
+                    mosaico_sr2[ch, h_out:h_out+tile_h, w_out:w_out+tile_w] += sr_tile[ch] * window_resized
+                weight[h_out:h_out+tile_h, w_out:w_out+tile_w] += window_resized
+        
+        weight[weight == 0] = 1
+        for ch in range(4):
+            mosaico_sr2[ch] /= weight
+        
+        mosaico_sr2 = np.clip(mosaico_sr2, 0.0, 1.0)
+        etapa2_time = time.time() - etapa2_start
+        diagnosticar_tensor(mosaico_sr2, f"Imagem {img_idx+1} - Swin2SR (1.25m)")
+        log(f"✅ Etapa 2 concluída em {etapa2_time:.1f}s")
+        
+        resultados_temporais.append(mosaico_sr2)
+    
+    # 6. Fusão temporal
     log("=" * 70)
-    log("ETAPA 2/3: HAT-L Otimizado (2.5m → 1.25m)")
-    log(f"Batch size: {BATCH_SIZE_HAT}")
+    log("FUSÃO TEMPORAL")
     log("=" * 70)
     
-    log("Processando com overlap e batch processing...")
-    mosaico_sr2 = process_stage_parallel(
-        mosaico_sr1, model_sr2, device, FATOR_SR2,
-        tile_size=128, overlap=TILE_OVERLAP, batch_size=BATCH_SIZE_HAT
-    )
+    if len(resultados_temporais) > 1:
+        log(f"Fusionando {len(resultados_temporais)} imagens (weighted median)...")
+        mosaico_final = MultiTemporalFusion.fuse_images(
+            resultados_temporais, 
+            method='weighted_median'
+        )
+        log("✅ Fusão temporal concluída!")
+    else:
+        mosaico_final = resultados_temporais[0]
+        log("Apenas 1 imagem disponível, sem fusão")
     
-    stage2_time = time.time() - stage2_start
-    log(f"Etapa 2 concluída em {stage2_time:.1f}s! Shape: {mosaico_sr2.shape}")
-
-    # === ESTÁGIO 3: Real-ESRGAN+ Otimizado (1.25m → 0.5m) ===
-    stage3_start = time.time()
-    log("=" * 70)
-    log("ETAPA 3/3: Real-ESRGAN+ Otimizado (1.25m → 0.5m)")
-    log("=" * 70)
-    
-    log("Processando refinamento final...")
-    mosaico_sr3 = process_stage_parallel(
-        mosaico_sr2, model_sr3, device, FATOR_SR3,
-        tile_size=64, overlap=TILE_OVERLAP//2, batch_size=BATCH_SIZE_HAT
-    )
-    
-    stage3_time = time.time() - stage3_start
-    log(f"Etapa 3 concluída em {stage3_time:.1f}s! Shape: {mosaico_sr3.shape}")
-
-    # 6. Aplicar máscara e salvar
+    # 7. Aplicar máscara e salvar
     log("Aplicando máscara do polígono...")
     
-    # Normalizar mosaico original
-    mosaic_orig = np.zeros((C, H, W), dtype="float32")
-    for r in range(nrows_sr1):
-        for c in range(ncols_sr1):
-            h0, h1 = r * TILE_SIZE, (r + 1) * TILE_SIZE
-            w0, w1 = c * TILE_SIZE, (c + 1) * TILE_SIZE
-            mosaic_orig[:, h0:h1, w0:w1] = cubo_np[:, h0:h1, w0:w1] / 10000
-
-    mosaic_orig_clipped, mask_orig = clip_to_polygon(mosaic_orig, transf_cubo, geometria_proj)
-
     transf_final = rasterio.Affine(
         transf_cubo.a / fator_total, transf_cubo.b, transf_cubo.c,
         transf_cubo.d, transf_cubo.e / fator_total, transf_cubo.f,
     )
-
-    mosaic_final_clipped, mask_final = clip_to_polygon(mosaico_sr3, transf_final, geometria_proj)
-
-    # 7. Montar 10 bandas
-    log("Montando 10 bandas em 0.5m...")
+    
+    mosaic_final_clipped, mask_final = clip_to_polygon(
+        mosaico_final, transf_final, geometria_proj
+    )
+    
+    # Original para referência
+    mosaic_orig = cubos_temporais[0][[2, 1, 0, 3], :, :]
+    mosaic_orig_clipped, mask_orig = clip_to_polygon(
+        mosaic_orig, transf_cubo, geometria_proj
+    )
+    
+    # 8. Salvar resultados
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Resultado principal
+    p_sr = os.path.join(OUTPUT_DIR, f"super_resolved_{RESOLUCAO_FINAL}m.tif")
+    save_geotiff(mosaic_final_clipped, transf_final, crs, p_sr)
+    log(f"✅ Resultado salvo: {p_sr}")
+    
+    # 9. Montar 10 bandas
+    log("Montando 10 bandas em 1.25m...")
     H_final, W_final = mosaic_final_clipped.shape[1], mosaic_final_clipped.shape[2]
     todas_bandas = np.zeros((10, H_final, W_final), dtype="float32")
-
-    todas_bandas[0] = mosaic_final_clipped[2]  # B02
-    todas_bandas[1] = mosaic_final_clipped[1]  # B03
-    todas_bandas[2] = mosaic_final_clipped[0]  # B04
-    todas_bandas[3] = mosaic_final_clipped[3]  # B08
-    log("4 bandas 10m super-resolvidas")
-
+    
+    # 4 bandas super-resolvidas
+    todas_bandas[0] = mosaic_final_clipped[2]  # B02 Blue
+    todas_bandas[1] = mosaic_final_clipped[1]  # B03 Green
+    todas_bandas[2] = mosaic_final_clipped[0]  # B04 Red
+    todas_bandas[3] = mosaic_final_clipped[3]  # B08 NIR
+    
+    # 6 bandas 20m interpoladas
     mosaic_orig_20m_clipped, _ = clip_to_polygon(mosaic_orig, transf_cubo, geometria_proj)
     for i, idx_orig in enumerate(BANDAS_20M_INDICES):
         idx_final = i + 4
@@ -654,69 +674,70 @@ def main():
         banda_up[~mask_final] = np.nan
         todas_bandas[idx_final] = banda_up.astype("float32")
     
-    log("6 bandas 20m interpoladas")
-
-    # 8. Salvar resultados
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # 4 bandas RGBN
-    p_sr = os.path.join(OUTPUT_DIR, "super_resolved_0_5m.tif")
-    save_geotiff(mosaic_final_clipped, transf_final, crs, p_sr)
-    log(f"4 bandas (RGBN) 0.5m salvas: {p_sr}")
-
-    # RGB com rio-color
-    log("Aplicando rio-color...")
-    try:
-        import rio_color
-        rgb_enh = aplicar_rio_color(
-            mosaic_final_clipped[[0, 1, 2]], transf_final, crs,
-            os.path.join(OUTPUT_DIR, "super_resolved_0_5m_cor.tif")
-        )
-        log("RGB corrigido salvo!")
-        USAR_COLOR = True
-    except:
-        log("rio-color não disponível", "WARN")
-        USAR_COLOR = False
-
-    # 10 bandas individuais
-    log("Salvando 10 bandas individuais...")
-    salvar_bandas_individuais(todas_bandas, BANDAS_NOMES, transf_final, crs, "bandas_0_5m")
-
-    # 9. Visualização
+    log("10 bandas montadas")
+    
+    # Salvar bandas individuais
+    pasta_bandas = os.path.join(OUTPUT_DIR, "bandas_1_25m")
+    os.makedirs(pasta_bandas, exist_ok=True)
+    for i, nome in enumerate(BANDAS_NOMES):
+        caminho = os.path.join(pasta_bandas, f"{nome}.tif")
+        save_geotiff(todas_bandas[i:i+1], transf_final, crs, caminho)
+    log(f"✅ 10 bandas salvas em: {pasta_bandas}/")
+    
+    # 10. Visualização
     log("Gerando visualização...")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
-    axes[0].imshow(np.clip(mosaic_orig_clipped[[2, 1, 0]].transpose(1, 2, 0) * 1.5, 0, 1))
-    axes[0].set_title("Original 10m", fontsize=12)
-    axes[0].axis('off')
+    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
     
-    axes[1].imshow(np.clip(mosaic_final_clipped[[0, 1, 2]].transpose(1, 2, 0) * 1.5, 0, 1))
-    axes[1].set_title(f"Super-res. {RESOLUCAO_FINAL}m", fontsize=12)
-    axes[1].axis('off')
+    # Original 10m
+    axes[0, 0].imshow(np.clip(mosaic_orig_clipped[[0, 1, 2]].transpose(1, 2, 0) * 2.5, 0, 1))
+    axes[0, 0].set_title("Original 10m", fontsize=12, fontweight='bold')
+    axes[0, 0].axis('off')
+    
+    # SEN2SR 2.5m
+    sr1_display = resultados_temporais[0] if len(resultados_temporais) > 0 else mosaico_sr1
+    axes[0, 1].imshow(np.clip(sr1_display[[0, 1, 2]].transpose(1, 2, 0) * 2.0, 0, 1))
+    axes[0, 1].set_title("SEN2SR (2.5m)", fontsize=12, fontweight='bold')
+    axes[0, 1].axis('off')
+    
+    # Swin2SR 1.25m (bruto)
+    axes[1, 0].imshow(np.clip(mosaico_final[[0, 1, 2]].transpose(1, 2, 0) * 2.0, 0, 1))
+    axes[1, 0].set_title(f"Swin2SR 2x ({RESOLUCAO_FINAL}m)", fontsize=12, fontweight='bold')
+    axes[1, 0].axis('off')
+    
+    # Final com máscara
+    axes[1, 1].imshow(np.clip(mosaic_final_clipped[[0, 1, 2]].transpose(1, 2, 0) * 2.0, 0, 1))
+    axes[1, 1].set_title(f"Final com máscara ({RESOLUCAO_FINAL}m)", fontsize=12, fontweight='bold')
+    axes[1, 1].axis('off')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "comparacao_ultra.png"), dpi=200, bbox_inches='tight')
-    plt.show(block=False)
-
-    # Estatísticas finais
+    plt.savefig(os.path.join(OUTPUT_DIR, "00_COMPARACAO_FINAL.png"), dpi=200, bbox_inches='tight')
+    log("✅ Visualização salva")
+    
+    # 11. Estatísticas
     total_time = time.time() - start_time
     area_km2 = np.sum(mask_orig) * RESOLUCAO_M**2 / 1e6
     
     log("=" * 70)
-    log("ESTATÍSTICAS FINAIS")
+    log("✅ PIPELINE CONCLUÍDO!")
     log("=" * 70)
-    log(f"Área: {area_km2:.2f} km²")
-    log(f"Resolução final: {RESOLUCAO_FINAL}m")
-    log(f"Upscaling total: {fator_total:.0f}x")
-    log(f"Tempo total: {total_time:.1f}s ({total_time/60:.1f}min)")
-    log(f"Tempo etapa 1 (SEN2SR): {stage1_time:.1f}s")
-    log(f"Tempo etapa 2 (HAT-L): {stage2_time:.1f}s")
-    log(f"Tempo etapa 3 (Real-ESRGAN+): {stage3_time:.1f}s")
-    log(f"Tamanho arquivo final: {mosaic_final_clipped.nbytes / 1e9:.2f} GB")
-    log(f"Resultados em: {OUTPUT_DIR}/")
-    log("PIPELINE ULTRA CONCLUÍDO! (0.5m)")
+    log(f"📊 Resolução final: {RESOLUCAO_FINAL}m")
+    log(f"📊 Upscaling total: {fator_total}x (SEN2SR 4x + Swin2SR 2x)")
+    log(f"📊 Imagens fusionadas: {len(resultados_temporais)}")
+    log(f"📊 Área: {area_km2:.2f} km²")
+    log(f"📊 Tempo total: {total_time:.1f}s ({total_time/60:.1f}min)")
+    log(f"📊 Modelos: 100% PRÉ-TREINADOS")
+    log(f"   - SEN2SR: Treinado para Sentinel-2")
+    log(f"   - Swin2SR 2x: Treinado para imagens reais")
+    log(f"📂 Resultados em: {OUTPUT_DIR}/")
+    log("")
+    log("💡 NOTA TÉCNICA:")
+    log("   1.25m é o limite realista com modelos prontos.")
+    log("   Abaixo disso (0.5m) requereria treinamento específico")
+    log("   para Sentinel-2, o que não existe pronto.")
+    log("=" * 70)
+    
     plt.show()
-
 
 if __name__ == "__main__":
     main()

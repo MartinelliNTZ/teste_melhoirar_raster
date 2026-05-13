@@ -12,3 +12,4 @@ model
 *.gpkg-wal
 .venv/
 __pycache__/
+*.png
