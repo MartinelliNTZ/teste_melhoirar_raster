@@ -11,3 +11,4 @@ rioxarray
 geopandas
 pyproj
 sen2sr
+rio-color
