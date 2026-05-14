@@ -200,10 +200,24 @@ def main():
     # 9. Salvar tudo
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # Nome de arquivo baseado na data da cena
+    date_tag = selected_item.datetime.strftime('%Y%m%d')
+    collection_tag = 'st2'
+    band_aliases = {
+        'B01': 'COASTAL', 'B02': 'BLUE', 'B03': 'GREEN', 'B04': 'RED',
+        'B05': 'RE', 'B06': 'RE', 'B07': 'RE', 'B08': 'NIR', 'B8A': 'NIR2',
+        'B09': 'WATERVAPOR', 'B11': 'SWIR1', 'B12': 'SWIR2'
+    }
+
+    def band_filename(band):
+        alias = band_aliases.get(band, '')
+        alias_part = f'_{alias}' if alias else ''
+        return f'{band}{alias_part}_{date_tag}_{collection_tag}.tif'
+
     # Bandas individuais
     print("\n💾 Salvando bandas individuais...")
     for i, banda in enumerate(BANDAS_ALL):
-        fname = os.path.join(OUTPUT_DIR, f"{banda}.tif")
+        fname = os.path.join(OUTPUT_DIR, band_filename(banda))
         with rasterio.open(
             fname, 'w', driver='GTiff',
             height=cubo_clip.shape[1], width=cubo_clip.shape[2],
@@ -216,7 +230,7 @@ def main():
     # RGB montado (B04,B03,B02)
     idx_rgb = [BANDAS_ALL.index(b) for b in RGB_BANDS]
     rgb = cubo_clip[idx_rgb]
-    fname_rgb = os.path.join(OUTPUT_DIR, "RGB.tif")
+    fname_rgb = os.path.join(OUTPUT_DIR, f'RGB_{date_tag}_{collection_tag}.tif')
     with rasterio.open(
         fname_rgb, 'w', driver='GTiff',
         height=rgb.shape[1], width=rgb.shape[2],
@@ -226,16 +240,25 @@ def main():
         dst.write(rgb)
     print(f"  {fname_rgb}")
 
-    # Stack completo (todas as bandas)
-    fname_all = os.path.join(OUTPUT_DIR, "allbands.tif")
+    # Stack final: se só vier RGB, não nomear como allbands
+    if cubo_clip.shape[0] == len(BANDAS_ALL):
+        fname_stack = os.path.join(OUTPUT_DIR, f'allbands_{date_tag}_{collection_tag}.tif')
+        stack_count = len(BANDAS_ALL)
+    elif cubo_clip.shape[0] == 3:
+        fname_stack = os.path.join(OUTPUT_DIR, f'RGB_stack_{date_tag}_{collection_tag}.tif')
+        stack_count = 3
+    else:
+        fname_stack = os.path.join(OUTPUT_DIR, f'stack_{date_tag}_{collection_tag}.tif')
+        stack_count = cubo_clip.shape[0]
+
     with rasterio.open(
-        fname_all, 'w', driver='GTiff',
+        fname_stack, 'w', driver='GTiff',
         height=cubo_clip.shape[1], width=cubo_clip.shape[2],
-        count=len(BANDAS_ALL), dtype=rasterio.float32,
+        count=stack_count, dtype=rasterio.float32,
         crs=crs, transform=transform_cubo, compress='lzw'
     ) as dst:
         dst.write(cubo_clip)
-    print(f"  {fname_all}")
+    print(f"  {fname_stack}")
 
     print("\n🎉 Download concluído! Arquivos salvos em:", os.path.abspath(OUTPUT_DIR))
 
