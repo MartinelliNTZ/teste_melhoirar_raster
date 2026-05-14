@@ -6,6 +6,7 @@ todas as bandas (separadas) + RGB.
 
 import os
 import socket
+import time
 import numpy as np
 import geopandas as gpd
 import cubo
@@ -21,13 +22,13 @@ from pystac_client import Client
 # =============================================================================
 # CONFIGURAÇÕES
 # =============================================================================
-VETOR_LIMITE = "vetores/limite.gpkg"   # seu polígono
+VETOR_LIMITE = "vetores/limite.gpkg"
 START_DATE   = "2024-09-08"
 END_DATE     = "2025-09-08"
-CLOUD_LIMIT  = 0.5                     # só mostra imagens com nuvens ≤ 50%
+CLOUD_LIMIT  = 0.5                     # filtrar imagens com nuvens ≤ 50%
 BANDAS_ALL   = ["B01","B02","B03","B04","B05","B06","B07","B08",
                 "B8A","B09","B11","B12"]
-RGB_BANDS    = ["B04", "B03", "B02"]   # para o RGB montado
+RGB_BANDS    = ["B04", "B03", "B02"]   # para montar o RGB
 RESOLUTION   = 10
 OUTPUT_DIR   = "result_8"
 STAC_API     = "https://earth-search.aws.element84.com/v1"
@@ -47,7 +48,6 @@ def check_dns(hostname, timeout=5):
         socket.setdefaulttimeout(None)
 
 def compute_with_retry(da, max_tries=5, delay=2.0, backoff=2.0):
-    import time
     for attempt in range(1, max_tries + 1):
         try:
             return da.compute().to_numpy()
@@ -76,7 +76,7 @@ def main():
     print("CATÁLOGO SENTINEL-2 + DOWNLOAD (TODAS AS BANDAS + RGB)")
     print("=" * 60)
 
-    # 1. Verificar internet
+    # 1. Conectividade
     print("Verificando conectividade...")
     if not check_dns("earth-search.aws.element84.com") and not check_dns("google.com"):
         print("  [!!] SEM INTERNET. Abortando.")
@@ -90,7 +90,7 @@ def main():
         gdf.set_crs("EPSG:4326", inplace=True)
     elif gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs("EPSG:4326")
-    bbox = gdf.total_bounds  # [minx, miny, maxx, maxy]
+    bbox = gdf.total_bounds
     geometria = unary_union(gdf.geometry.values)
     print(f"  Bbox WGS84: {bbox}")
 
@@ -98,46 +98,46 @@ def main():
     cy = (bbox[1] + bbox[3]) / 2.0
     print(f"  Centro: lat={cy:.6f}, lon={cx:.6f}")
 
-    # 3. Tamanho do cubo (pixels 10m)
+    # 3. Tamanho do cubo
     lat_rad = radians(cy)
     m_per_deg_lon = 111320.0 * cos(lat_rad)
     m_per_deg_lat = 111320.0
     largura_m = (bbox[2] - bbox[0]) * m_per_deg_lon
     altura_m  = (bbox[3] - bbox[1]) * m_per_deg_lat
     edge_px = int(np.ceil(max(largura_m, altura_m) / RESOLUTION))
-    edge_px = int(edge_px * 1.1)  # 10% de folga
+    edge_px = int(edge_px * 1.1)
     print(f"  Área aprox: {largura_m:.0f}m × {altura_m:.0f}m")
     print(f"  Cubo: {edge_px}×{edge_px} pixels\n")
 
-    # 4. Catálogo STAC (apenas para listar e filtrar nuvens)
+    # 4. Buscar imagens no STAC
     print("🔎 Buscando imagens no catálogo STAC...")
     catalog = Client.open(STAC_API)
     search = catalog.search(
         collections=[COLLECTION],
         bbox=list(bbox),
         datetime=f"{START_DATE}/{END_DATE}",
-        max_items=200  # limite seguro
+        max_items=200
     )
     items = list(search.items())
     print(f"  {len(items)} cenas encontradas no total.\n")
 
     if not items:
-        print("Nenhuma imagem disponível no período. Verifique datas ou área.")
+        print("Nenhuma imagem disponível no período.")
         return
 
-    # 5. Filtrar por nuvens ≤ CLOUD_LIMIT e montar tabela
+    # 5. Filtrar por nuvens
     valid_items = []
     print(f"{'Índice':<6} {'Data':<12} {'Nuvens %':<10} {'ID da cena'}")
     print("-" * 70)
-    for i, item in enumerate(items):
-        cloud = item.properties.get("eo:cloud_cover", 100)  # padrão 100% se ausente
-        if cloud <= CLOUD_LIMIT * 100:  # STAC retorna em % (0-100)
+    for item in items:
+        cloud = item.properties.get("eo:cloud_cover", 100)
+        if cloud <= CLOUD_LIMIT * 100:   # STAC retorna %
             valid_items.append(item)
             print(f"{len(valid_items):<6} {item.datetime.strftime('%Y-%m-%d'):<12} {cloud:5.1f}%     {item.id}")
     print("-" * 70)
 
     if not valid_items:
-        print("Nenhuma imagem com nuvens ≤ 50% no período. Aumente o limite ou mude as datas.")
+        print(f"Nenhuma imagem com nuvens ≤ {CLOUD_LIMIT*100:.0f}%.")
         return
 
     # 6. Seleção do usuário
@@ -146,7 +146,7 @@ def main():
             idx = int(input(f"\nDigite o índice da imagem desejada (1 a {len(valid_items)}): "))
             if 1 <= idx <= len(valid_items):
                 break
-            print(f"  Índice fora do intervalo. Tente novamente.")
+            print("  Índice fora do intervalo. Tente novamente.")
         except ValueError:
             print("  Digite um número inteiro.")
 
@@ -155,10 +155,12 @@ def main():
     print(f"   Data: {selected_item.datetime.strftime('%Y-%m-%d')}")
     print(f"   Nuvens: {selected_item.properties.get('eo:cloud_cover'):.1f}%")
 
-    # 7. Download usando cubo (item específico + recorte espacial fixo)
+    # 7. Download usando cubo (passando collection, start_date, end_date)
     print("\n⏳ Baixando todas as bandas (10m)...")
     da = cubo.create(
-        item=selected_item,      # cena exata
+        collection=COLLECTION,
+        start_date=selected_item.datetime.strftime('%Y-%m-%d'),
+        end_date=selected_item.datetime.strftime('%Y-%m-%d'),
         bands=BANDAS_ALL,
         resolution=RESOLUTION,
         lat=cy,
@@ -176,6 +178,11 @@ def main():
     cubo_np = compute_with_retry(da)
     print(f"  Shape bruto: {cubo_np.shape}")
 
+    # Remover dimensão temporal se existir
+    if cubo_np.ndim == 4 and cubo_np.shape[0] == 1:
+        cubo_np = cubo_np.squeeze(axis=0)
+    print(f"  Shape após squeeze: {cubo_np.shape}")
+
     # 8. Máscara do polígono
     print("Aplicando máscara do polígono...")
     project = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
@@ -190,10 +197,10 @@ def main():
     for b in range(cubo_clip.shape[0]):
         cubo_clip[b][~mask] = np.nan
 
-    # 9. Salvar os resultados em result_8/
+    # 9. Salvar tudo
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 9a. Bandas individuais
+    # Bandas individuais
     print("\n💾 Salvando bandas individuais...")
     for i, banda in enumerate(BANDAS_ALL):
         fname = os.path.join(OUTPUT_DIR, f"{banda}.tif")
@@ -206,8 +213,8 @@ def main():
             dst.write(cubo_clip[i], 1)
         print(f"  {fname}")
 
-    # 9b. RGB montado (B04=índice 3, B03=índice 2, B02=índice 1)
-    idx_rgb = [BANDAS_ALL.index(b) for b in RGB_BANDS]  # [3,2,1] (B04,B03,B02)
+    # RGB montado (B04,B03,B02)
+    idx_rgb = [BANDAS_ALL.index(b) for b in RGB_BANDS]
     rgb = cubo_clip[idx_rgb]
     fname_rgb = os.path.join(OUTPUT_DIR, "RGB.tif")
     with rasterio.open(
@@ -219,7 +226,7 @@ def main():
         dst.write(rgb)
     print(f"  {fname_rgb}")
 
-    # 9c. Stack completo (todas as bandas juntas)
+    # Stack completo (todas as bandas)
     fname_all = os.path.join(OUTPUT_DIR, "allbands.tif")
     with rasterio.open(
         fname_all, 'w', driver='GTiff',
