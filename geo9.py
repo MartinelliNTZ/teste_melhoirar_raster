@@ -14,6 +14,7 @@ import rasterio
 import rioxarray
 from rasterio.crs import CRS
 from rasterio.features import geometry_mask
+from shapely.geometry import box
 from shapely.ops import unary_union, transform as shapely_transform
 import pyproj
 from math import cos, radians
@@ -23,8 +24,8 @@ from pystac_client import Client
 # CONFIGURAÇÕES
 # =============================================================================
 VETOR_LIMITE = "vetores/limite.gpkg"
-START_DATE   = "2024-09-08"
-END_DATE     = "2025-09-08"
+START_DATE   = "2025-11-01"
+END_DATE     = "2026-04-02"
 CLOUD_LIMIT  = 0.5                     # filtrar imagens com nuvens ≤ 50%
 BANDAS_ALL   = ["B01","B02","B03","B04","B05","B06","B07","B08",
                 "B8A","B09","B11","B12"]
@@ -37,6 +38,31 @@ COLLECTION   = "sentinel-2-l2a"
 # =============================================================================
 # FUNÇÕES AUXILIARES
 # =============================================================================
+def diagnose_vector(vetor_path):
+    """Imprime diagnóstico detalhado do arquivo vetorial"""
+    print(f"\n{'='*60}")
+    print(f"DIAGNÓSTICO DO VETOR: {vetor_path}")
+    print(f"{'='*60}")
+    try:
+        gdf = gpd.read_file(vetor_path)
+        print(f"✓ Arquivo: {vetor_path}")
+        print(f"  Número de features: {len(gdf)}")
+        print(f"  CRS: {gdf.crs}")
+        print(f"  Bounds (WGS84 ou nativo): {gdf.total_bounds}")
+        print(f"  Tipos de geometria: {gdf.geometry.type.unique()}")
+        print(f"  Áreas das feições:")
+        for idx, row in gdf.iterrows():
+            geom = row.geometry
+            area = geom.area if hasattr(geom, 'area') else 'N/A'
+            bounds = geom.bounds if hasattr(geom, 'bounds') else 'N/A'
+            print(f"    [{idx}] tipo={geom.geom_type}, área={area}, bounds={bounds}")
+        print(f"{'='*60}\n")
+        return gdf
+    except Exception as e:
+        print(f"✗ ERRO ao ler vetor: {e}")
+        print(f"{'='*60}\n")
+        raise
+
 def check_dns(hostname, timeout=5):
     try:
         socket.setdefaulttimeout(timeout)
@@ -68,6 +94,59 @@ def utm_epsg(lon, lat):
     zone = int((lon + 180) // 6) + 1
     return 32600 + zone if lat >= 0 else 32700 + zone
 
+def create_bbox_square(bbox, margin=0.05):
+    """
+    Cria um quadrado em graus que contém completamente o bounding box original.
+    O quadrado é perfeitamente alinhado (sem rotação).
+    
+    Args:
+        bbox: [min_lon, min_lat, max_lon, max_lat]
+        margin: margem adicional em fração do lado do quadrado (0.05 = 5%)
+    
+    Returns:
+        bbox_quadrado: [min_lon, min_lat, max_lon, max_lat] (quadrado perfeito)
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox
+    
+    # Dimensões do bbox original
+    width = max_lon - min_lon
+    height = max_lat - min_lat
+    
+    # Lado do quadrado = maior dimensão + margem
+    lado = max(width, height) * (1.0 + margin)
+    
+    # Centro do bbox original
+    cx = (min_lon + max_lon) / 2.0
+    cy = (min_lat + max_lat) / 2.0
+    
+    # Criar quadrado centrado
+    lado_2 = lado / 2.0
+    bbox_quadrado = [
+        cx - lado_2,
+        cy - lado_2,
+        cx + lado_2,
+        cy + lado_2
+    ]
+    
+    print(f"\n  📐 Quadrado criado:")
+    print(f"    Bbox original: {bbox}")
+    print(f"    Lado do quadrado: {lado:.6f}°")
+    print(f"    Bbox quadrado: {bbox_quadrado}")
+    
+    return bbox_quadrado
+
+def save_square_vector(bbox_square, output_path="vetores/limite_quadrado.gpkg"):
+    """Salva o quadrado intermediário em um arquivo vetorial se ainda não existir."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    if os.path.exists(output_path):
+        print(f"  Vetor intermediário já existe: {output_path}")
+        return output_path
+    square_geom = box(*bbox_square)
+    square_gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[square_geom], crs="EPSG:4326")
+    square_gdf.to_file(output_path, driver="GPKG")
+    print(f"  Vetor intermediário salvo em: {output_path}")
+    return output_path
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -85,7 +164,7 @@ def main():
 
     # 2. Ler vetor
     print(f"Lendo vetor: {VETOR_LIMITE}")
-    gdf = gpd.read_file(VETOR_LIMITE)
+    gdf = diagnose_vector(VETOR_LIMITE)
     if gdf.crs is None:
         gdf.set_crs("EPSG:4326", inplace=True)
     elif gdf.crs.to_epsg() != 4326:
@@ -98,16 +177,29 @@ def main():
     cy = (bbox[1] + bbox[3]) / 2.0
     print(f"  Centro: lat={cy:.6f}, lon={cx:.6f}")
 
-    # 3. Tamanho do cubo
-    lat_rad = radians(cy)
+    # 3. Criar quadrado que contém completamente o polígono
+    bbox_square = create_bbox_square(bbox, margin=0.05)
+    save_square_vector(bbox_square, output_path="vetores/limite_quadrado.gpkg")
+    
+    # Para o cubo.create(), vamos usar o bbox_square
+    sq_min_lon, sq_min_lat, sq_max_lon, sq_max_lat = bbox_square
+    sq_cx = (sq_min_lon + sq_max_lon) / 2.0
+    sq_cy = (sq_min_lat + sq_max_lat) / 2.0
+    sq_width = sq_max_lon - sq_min_lon
+    sq_height = sq_max_lat - sq_min_lat
+    
+    # Tamanho em pixels (quadrado, portanto width == height)
+    lat_rad = radians(sq_cy)
     m_per_deg_lon = 111320.0 * cos(lat_rad)
     m_per_deg_lat = 111320.0
-    largura_m = (bbox[2] - bbox[0]) * m_per_deg_lon
-    altura_m  = (bbox[3] - bbox[1]) * m_per_deg_lat
-    edge_px = int(np.ceil(max(largura_m, altura_m) / RESOLUTION))
-    edge_px = int(edge_px * 1.1)
-    print(f"  Área aprox: {largura_m:.0f}m × {altura_m:.0f}m")
-    print(f"  Cubo: {edge_px}×{edge_px} pixels\n")
+    
+    sq_width_m = sq_width * m_per_deg_lon
+    sq_height_m = sq_height * m_per_deg_lat
+    edge_px = int(np.ceil(max(sq_width_m, sq_height_m) / RESOLUTION))
+    
+    print(f"\n  Área do quadrado: {sq_width_m:.0f}m × {sq_height_m:.0f}m")
+    print(f"  Cubo: {edge_px}×{edge_px} pixels")
+    print(f"  Centro cubo: lat={sq_cy:.6f}, lon={sq_cx:.6f}\n")
 
     # 4. Buscar imagens no STAC
     print("🔎 Buscando imagens no catálogo STAC...")
@@ -163,8 +255,8 @@ def main():
         end_date=selected_item.datetime.strftime('%Y-%m-%d'),
         bands=BANDAS_ALL,
         resolution=RESOLUTION,
-        lat=cy,
-        lon=cx,
+        lat=sq_cy,
+        lon=sq_cx,
         edge_size=edge_px
     )
 
@@ -181,21 +273,40 @@ def main():
     # Remover dimensão temporal se existir
     if cubo_np.ndim == 4 and cubo_np.shape[0] == 1:
         cubo_np = cubo_np.squeeze(axis=0)
-    print(f"  Shape após squeeze: {cubo_np.shape}")
+        print(f"  Squeeze (tempo): {cubo_np.shape}")
+    
+    # DIAGNÓSTICO: Verificar estrutura dos dados
+    print(f"\n  [DIAGNÓSTICO] Dimensões do cubo:")
+    print(f"    ndim: {cubo_np.ndim}")
+    print(f"    shape: {cubo_np.shape}")
+    
+    if cubo_np.ndim == 4:
+        print(f"    ⚠ AVISO: 4 dimensões (possível múltiplos sub-cubos/tiles)")
+        print(f"      Dim 0: {cubo_np.shape[0]}")
+        print(f"      Dim 1: {cubo_np.shape[1]}")
+        print(f"      Dim 2: {cubo_np.shape[2]}")
+        print(f"      Dim 3: {cubo_np.shape[3]}")
+        print(f"\n    → Usando primeiro sub-cubo (índice 0)...")
+        # Se temos múltiplos sub-cubos, usar o primeiro
+        if cubo_np.shape[1] == len(BANDAS_ALL):
+            # Estrutura: (n_cubos, bandas, altura, largura)
+            cubo_np = cubo_np[0]
+            print(f"      Extraído: {cubo_np.shape}")
+        else:
+            # Talvez seja (tempo, bandas, altura, largura)
+            cubo_np = cubo_np.squeeze(axis=0)
+            print(f"      Extraído (squeeze): {cubo_np.shape}")
+    elif cubo_np.ndim == 3:
+        print(f"    ✓ OK: 3 dimensões (bandas, altura, largura)")
+        print(f"      Bandas: {cubo_np.shape[0]} (esperado: {len(BANDAS_ALL)})")
+        print(f"      Altura: {cubo_np.shape[1]}")
+        print(f"      Largura: {cubo_np.shape[2]}")
+    print()
 
     # 8. Máscara do polígono
-    print("Aplicando máscara do polígono...")
-    project = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
-    geometria_proj = shapely_transform(project, geometria)
-    mask = geometry_mask(
-        [geometria_proj],
-        transform=transform_cubo,
-        invert=True,
-        out_shape=(cubo_np.shape[1], cubo_np.shape[2])
-    )
+    print("Não aplicando máscara (mantendo dados do quadrado retangular)...")
+    # Dados já estão prontos - mantém o quadrado completo sem recorte
     cubo_clip = cubo_np.copy().astype("float32")
-    for b in range(cubo_clip.shape[0]):
-        cubo_clip[b][~mask] = np.nan
 
     # 9. Salvar tudo
     os.makedirs(OUTPUT_DIR, exist_ok=True)
