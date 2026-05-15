@@ -1,0 +1,15 @@
+{
+  "id": "S2C_23MKR_20260121_0_L2A",
+  "data": "2026-01-21T13:33:30.288000Z",
+  "tile": "23MKR",
+  "plataforma": "S2C",
+  "nuvens_%": 45.977798,
+  "epsg_original": null,
+  "bandas_baixadas": [
+    "20260121_23MKR_S2C_B04.tif",
+    "20260121_23MKR_S2C_B03.tif",
+    "20260121_23MKR_S2C_B02.tif"
+  ],
+  "recortado": true,
+  "epsg_saida": null
+}
