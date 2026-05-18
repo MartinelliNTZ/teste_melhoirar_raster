@@ -41,7 +41,9 @@ IMAGENS_SELECIONADAS = "interactive"
 #   "todas"     → todas as bandas disponíveis
 # Ou liste manualmente as bandas que quiser:
 #   BANDAS = ["B04", "B03", "B02", "B08"]
-BANDAS = "rgb"
+# Placeholder: `BANDAS` será inicializado após `BANDAS_INFO` ser criado mais abaixo.
+# Defina manualmente aqui se quiser um comportamento diferente.
+BANDAS = None
 
 # ── Recorte pela máscara do shapefile ─────────────────────────────────────────
 # True  → recortar pelo polígono exato do shapefile
@@ -162,13 +164,34 @@ BANDAS_DISPONIVEIS = {
     "SCL": ("Scene Classification",    "20m"),
 }
 
+# Dicionário com todas as bandas ativas por padrão
+# Útil para scripts que prefiram uma seleção por chave booleana
+BANDAS_INFO = {}
+for b, v in BANDAS_DISPONIVEIS.items():
+    aliases = ASSET_MAP.get(b, [b])
+    BANDAS_INFO[b] = {
+        "aliases": aliases,
+        "desc": v[0],
+        "res": v[1],
+        "enabled": True,
+    }
+
+# Dicionário simples {band: bool} para compatibilidade e seleção rápida
+BANDAS_DICT = {b: info["enabled"] for b, info in BANDAS_INFO.items()}
+
+# Se o usuário não definiu `BANDAS` no topo, ativar todas por padrão
+if BANDAS is None:
+    BANDAS = BANDAS_DICT
+
+
+
 COMPOSICOES_PRONTAS = {
     "1": {"nome": "RGB Natural",          "bandas": ["B04", "B03", "B02"]},
     "2": {"nome": "Falsa Cor (NIR)",      "bandas": ["B08", "B04", "B03"]},
     "3": {"nome": "SWIR (Vegetação)",     "bandas": ["B12", "B8A", "B04"]},
     "4": {"nome": "Agricultura",          "bandas": ["B11", "B08", "B02"]},
     "5": {"nome": "Índice Urbano",        "bandas": ["B12", "B11", "B04"]},
-    "6": {"nome": "Todas as bandas",      "bandas": list(BANDAS_DISPONIVEIS.keys())},
+    "6": {"nome": "Todas as bandas",      "bandas": list(BANDAS_INFO.keys())},
     "7": {"nome": "Escolher manualmente", "bandas": None},
 }
 
@@ -415,8 +438,8 @@ def processar_item(item, bandas: list, gdf_wgs84: gpd.GeoDataFrame,
     resultados = []
 
     for banda in bandas:
-        # Buscar o asset pelo mapa de nomes alternativos
-        chaves_possiveis = ASSET_MAP.get(banda, [banda])
+        # Buscar o asset pelo mapa de nomes alternativos (usando BANDAS_INFO unificada)
+        chaves_possiveis = BANDAS_INFO.get(banda, {}).get("aliases", [banda])
         asset_key = None
         for chave in chaves_possiveis:
             if chave in assets:
@@ -437,7 +460,7 @@ def processar_item(item, bandas: list, gdf_wgs84: gpd.GeoDataFrame,
             resultados.append(caminho_final)
             continue
 
-        desc_banda = BANDAS_DISPONIVEIS.get(banda, ("?", "?"))[0]
+        desc_banda = BANDAS_INFO.get(banda, {}).get("desc", "?")
         print(f"     ↓ {banda} — {desc_banda} (asset: '{asset_key}')...")
 
         ok = baixar_url(url, caminho_temp, desc=banda)
@@ -503,15 +526,69 @@ def resolver_bandas(bandas_cfg) -> list:
         "swir":      ["B12", "B8A", "B04"],
         "agri":      ["B11", "B08", "B02"],
         "urbano":    ["B12", "B11", "B04"],
-        "todas":     list(BANDAS_DISPONIVEIS.keys()),
+        "todas":     list(BANDAS_INFO.keys()),
     }
-    if isinstance(bandas_cfg, list):
-        return bandas_cfg
-    chave = bandas_cfg.strip().lower()
-    if chave in PRESETS:
-        return PRESETS[chave]
-    # Tratado como lista separada por vírgula
-    return [b.strip().upper() for b in bandas_cfg.split(",") if b.strip()]
+    # Aceita dicionário {band: bool} ou {band: {"enabled": bool, ...}}
+    if isinstance(bandas_cfg, dict):
+        selecionadas = []
+        for b, v in bandas_cfg.items():
+            if isinstance(v, dict):
+                if v.get("enabled"):
+                    selecionadas.append(b)
+            else:
+                try:
+                    if bool(v):
+                        selecionadas.append(b)
+                except Exception:
+                    continue
+        return selecionadas
+
+    # Aceita lista: itens podem ser códigos de banda, nomes de presets ou índices de composicoes
+    if isinstance(bandas_cfg, (list, tuple)):
+        out = []
+        for item in bandas_cfg:
+            if item is None:
+                continue
+            s = str(item).strip()
+            # preset por nome
+            if s.lower() in PRESETS:
+                out.extend(PRESETS[s.lower()])
+                continue
+            # preset por indice (composicoes prontas)
+            if s in COMPOSICOES_PRONTAS:
+                bandas_comp = COMPOSICOES_PRONTAS[s]["bandas"]
+                if bandas_comp:
+                    out.extend(bandas_comp)
+                continue
+            # tratado como banda
+            out.append(s.upper())
+        # remover duplicatas mantendo ordem
+        vistos, unicos = set(), []
+        for b in out:
+            if b not in vistos:
+                vistos.add(b)
+                unicos.append(b)
+        return unicos
+
+    # Se for string, pode ser: preset, lista CSV de presets/bandas, ou índice de composicao
+    if isinstance(bandas_cfg, str):
+        v = bandas_cfg.strip()
+        # csv
+        if "," in v:
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            return resolver_bandas(parts)
+        # nome de preset
+        if v.lower() in PRESETS:
+            return PRESETS[v.lower()]
+        # composicao numerica
+        if v in COMPOSICOES_PRONTAS:
+            comp = COMPOSICOES_PRONTAS[v]["bandas"]
+            return comp if comp else []
+        # fim: assumir lista única banda
+        return [v.upper()]
+
+    # Caso desconhecido
+    return []
 
 
 def resolver_epsg(epsg_cfg, epsg_shapefile: int):

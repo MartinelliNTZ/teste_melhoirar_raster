@@ -6,9 +6,19 @@
   "nuvens_%": 45.977798,
   "epsg_original": null,
   "bandas_baixadas": [
-    "20260121_23MKR_S2C_B04.tif",
+    "20260121_23MKR_S2C_B01.tif",
+    "20260121_23MKR_S2C_B02.tif",
     "20260121_23MKR_S2C_B03.tif",
-    "20260121_23MKR_S2C_B02.tif"
+    "20260121_23MKR_S2C_B04.tif",
+    "20260121_23MKR_S2C_B05.tif",
+    "20260121_23MKR_S2C_B06.tif",
+    "20260121_23MKR_S2C_B07.tif",
+    "20260121_23MKR_S2C_B08.tif",
+    "20260121_23MKR_S2C_B8A.tif",
+    "20260121_23MKR_S2C_B09.tif",
+    "20260121_23MKR_S2C_B11.tif",
+    "20260121_23MKR_S2C_B12.tif",
+    "20260121_23MKR_S2C_SCL.tif"
   ],
   "recortado": true,
   "epsg_saida": null
