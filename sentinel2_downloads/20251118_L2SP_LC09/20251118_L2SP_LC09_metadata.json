@@ -1,0 +1,11 @@
+{
+  "id": "LC09_L2SP_222063_20251118_02_T1",
+  "data": "2025-11-18T13:18:02.630519Z",
+  "tile": "L2SP",
+  "plataforma": "LC09",
+  "nuvens_%": 26.19,
+  "epsg_original": null,
+  "bandas_baixadas": [],
+  "recortado": true,
+  "epsg_saida": null
+}
