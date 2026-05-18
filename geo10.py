@@ -28,8 +28,8 @@ MAX_NUVENS   = 50.0                       # Cobertura máxima de nuvens (%)
 
 # ── Seleção de imagens ────────────────────────────────────────────────────────
 # Números das imagens da tabela exibida, separados por vírgula. Ex: "1,3,5"
-# Use "1-5" para intervalo, ou "all" para todas.
-IMAGENS_SELECIONADAS = "all"
+# Use "1-5" para intervalo, "all" para todas ou "interactive" para escolher após a lista.
+IMAGENS_SELECIONADAS = "interactive"
 
 # ── Bandas para download ──────────────────────────────────────────────────────
 # Opções prontas (escolha UMA):
@@ -282,6 +282,24 @@ def exibir_tabela_imagens(itens: list) -> None:
 #  DOWNLOAD E PROCESSAMENTO
 # ══════════════════════════════════════════════════════════════════════════════
 
+def selecionar_itens_interativamente(itens: list) -> list:
+    """Pede ao usuário para escolher imagens a partir da lista exibida."""
+    while True:
+        escolha = input(
+            "  Digite os números das imagens para baixar (ex: 1,3,5 ou 1-4), ou 'all' para todas: "
+        ).strip().lower()
+        if not escolha or escolha == "all":
+            return itens
+
+        try:
+            selecionados = resolver_selecao(escolha, itens)
+            if selecionados:
+                return selecionados
+            print("  [Aviso] Nenhuma imagem válida na seleção. Tente novamente.")
+        except Exception as e:
+            print(f"  [Erro] Seleção inválida: {e}")
+
+
 def baixar_url(url: str, destino: Path, desc: str = "") -> bool:
     """Faz download de uma URL com barra de progresso."""
     try:
@@ -513,22 +531,33 @@ def resolver_epsg(epsg_cfg, epsg_shapefile: int):
 
 def resolver_selecao(selecao_cfg: str, itens: list) -> list:
     """Traduz IMAGENS_SELECIONADAS para lista de items."""
-    v = selecao_cfg.strip().lower()
-    if v == "all":
+    v = str(selecao_cfg).strip().lower()
+    if not v or v == "all":
         return itens
+    if v in {"interactive", "choose", "prompt", "selecionar"}:
+        return selecionar_itens_interativamente(itens)
 
     selecionados = []
     for parte in v.split(","):
         parte = parte.strip()
+        if not parte:
+            continue
         if "-" in parte:
             ini, fim = parte.split("-")
-            for n in range(int(ini), int(fim) + 1):
+            ini = int(ini)
+            fim = int(fim)
+            if ini > fim:
+                raise ValueError(f"Intervalo inválido: {parte}")
+            for n in range(ini, fim + 1):
                 if 1 <= n <= len(itens):
                     selecionados.append(itens[n - 1])
         else:
             n = int(parte)
             if 1 <= n <= len(itens):
                 selecionados.append(itens[n - 1])
+
+    if not selecionados:
+        return []
 
     # Remover duplicatas mantendo ordem
     vistos, unicos = set(), []
