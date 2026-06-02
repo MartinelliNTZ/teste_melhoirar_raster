@@ -1,0 +1,25 @@
+{
+  "id": "S2B_23MMP_20260523_0_L2A",
+  "data": "2026-05-23T13:23:53.376000Z",
+  "tile": "23MMP",
+  "plataforma": "S2B",
+  "nuvens_%": 37.690717,
+  "epsg_original": null,
+  "bandas_baixadas": [
+    "20260523_23MMP_S2B_B01.tif",
+    "20260523_23MMP_S2B_B02.tif",
+    "20260523_23MMP_S2B_B03.tif",
+    "20260523_23MMP_S2B_B04.tif",
+    "20260523_23MMP_S2B_B05.tif",
+    "20260523_23MMP_S2B_B06.tif",
+    "20260523_23MMP_S2B_B07.tif",
+    "20260523_23MMP_S2B_B08.tif",
+    "20260523_23MMP_S2B_B8A.tif",
+    "20260523_23MMP_S2B_B09.tif",
+    "20260523_23MMP_S2B_B11.tif",
+    "20260523_23MMP_S2B_B12.tif",
+    "20260523_23MMP_S2B_SCL.tif"
+  ],
+  "recortado": true,
+  "epsg_saida": null
+}

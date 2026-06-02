@@ -10,7 +10,7 @@ def click_loop():
     while True:
         if clicking:
             m.click(mouse.Button.left)
-            time.sleep(0.03)  # velocidade (menor = mais rápido)
+            time.sleep(0.04)  # velocidade (menor = mais rápido)
         else:
             time.sleep(0.01)
 

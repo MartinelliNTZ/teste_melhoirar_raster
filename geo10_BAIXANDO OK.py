@@ -21,7 +21,7 @@
 from datetime import datetime as _dt
 
 # ── Área e período ────────────────────────────────────────────────────────────
-SHAPEFILE    = r"vetores/limite.gpkg"     # Caminho para o vetor (shp/gpkg/geojson)
+SHAPEFILE    = r"vetores/limite2.gpkg"     # Caminho para o vetor (shp/gpkg/geojson)
 DATA_INICIO  = f"{_dt.now().year}-01-01"  # Início: usa o ano corrente automaticamente
 DATA_FIM     = f"{_dt.now().year}-12-31"  # Fim: usa o ano corrente automaticamente
 MAX_NUVENS   = 50.0                       # Cobertura máxima de nuvens (%)
@@ -57,7 +57,7 @@ RECORTAR = True
 EPSG_SAIDA = "utm"
 
 # ── Pasta de saída ────────────────────────────────────────────────────────────
-PASTA_SAIDA = r"sentinel2_downloads"
+PASTA_SAIDA = r"ourives"
 
 # ══════════════════════════════════════════════════════════════════════════════
 

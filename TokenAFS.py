@@ -1,0 +1,11 @@
+TOKEN_AFS = "eyJ0eXAiOiJKV1QiLCJvcmlnaW4iOiJFYXJ0aGRhdGEgTG9naW4iLCJzaWciOiJlZGxqd3RwdWJrZXlfb3BzIiwiYWxnIjoiUlMyNTYifQ.eyJ0eXBlIjoiVXNlciIsInVpZCI6Im10bDIxMyIsImV4cCI6MTc4NDMyMTk3MCwiaWF0IjoxNzc5MTM3OTcwLCJpc3MiOiJodHRwczovL3Vycy5lYXJ0aGRhdGEubmFzYS5nb3YiLCJpZGVudGl0eV9wcm92aWRlciI6ImVkbF9vcHMiLCJhY3IiOiJlZGwiLCJhc3N1cmFuY2VfbGV2ZWwiOjN9.m6PkgthJ-PUAZyVBU50sY7IlyBfe1E7c-e1WvbLk-fwRQ1QDAygoUsoLKFrMeqOJHibwBlfhgOTNJl9J4-RFHZm5EGh6yUYtQZ3NtbUa5mgBXj8IOAeel2EMOQFSiUYfQ4DTuaVZOGUoGjn-gUtrQGhZDRwjPkmjfYmsJuKfZRv6uRocsh4fki4yAUr5dQJLwFtz8r7OQu2blJBmIqLVk8V3w3CbnxEw_9AjcMPguTCP8IXylyzzjFYJy3vMWEhm_R7ktiIJcWaOgJ4quRPWH4Y6XgYxRNpKALs67lLTDgPBVOiczuxdeQIiqn2Nvc27wGF6P7KJHd7q8SrUFU3vfQ"
+import requests
+
+token = "eyJ0eXAiOiJKV1...seu_token_aqui"
+url = "https://datapool.asf.alaska.edu/RTC_HI_RES/A3/AP_26256_FBS_F6990_RT1.zip"
+headers = {"Authorization": f"Bearer {TOKEN_AFS}"}
+
+resp = requests.head(url, headers=headers)
+print(resp.status_code)  # Deve ser 200 se o token for válido
+
+
