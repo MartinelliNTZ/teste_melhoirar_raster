@@ -24,14 +24,15 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.features import geometry_mask
 from shapely.ops import unary_union
+from pyproj import Transformer
 
 # =============================================================================
 # CONFIGURAÇÕES (centralizadas no início)
 # =============================================================================
 
-VETOR_LIMITE = "vetores/limite.gpkg"
-START_DATE   = "2024-09-08"
-END_DATE     = "2025-09-08"
+VETOR_LIMITE = "vetores/limite2.gpkg"
+START_DATE   = "2025-05-29"
+END_DATE     = "2026-09-08"
 IMAGE_INDEX  = 0
 
 COLECAO      = "sentinel-2-l2a"
@@ -39,7 +40,7 @@ BANDAS       = ["B04", "B03", "B02", "B08"]
 RESOLUCAO_M  = 10
 FATOR_SR     = 4        # 10m → 2.5m
 TILE_SIZE    = 128
-OUTPUT_DIR   = "resultados"
+OUTPUT_DIR   = "resultados5"
 BLOB_HOST    = "sentinel2l2a01.blob.core.windows.net"
 
 # =============================================================================
@@ -214,14 +215,24 @@ def main():
     print(f"  CRS: {crs}")
     print(f"  Transform: {transf_cubo}")
 
-    # CRS geralmente vem como None do cubo, mas os valores do transform
-    # estão em coordenadas UTM (metros). Detectamos o EPSG pela localização.
+    # CRS geralmente vem como None do cubo. Reconstruímos o transform
+    # a partir do centro geográfico se o objeto não fornecer georreferência válida.
     from rasterio.crs import CRS as RioCRS
     if crs is None:
-        # Para a região de Palmas/TO (lat -10.18, lon -48.33), o UTM zone é 22S
-        # Hemisfério sul = EPSG:32722
         crs = RioCRS.from_epsg(32722)
         print(f"  [~] CRS definido manualmente como: {crs}")
+
+        # Reconstruir transform usando o centro em UTM do shapefile
+        x_center, y_center = Transformer.from_crs(
+            "EPSG:4326", crs, always_xy=True
+        ).transform(cx, cy)
+        x0 = x_center - (edge_px * RESOLUCAO_M) / 2.0
+        y0 = y_center + (edge_px * RESOLUCAO_M) / 2.0
+        transf_cubo = rasterio.Affine(
+            RESOLUCAO_M, 0.0, x0,
+            0.0, -RESOLUCAO_M, y0,
+        )
+        print(f"  [~] Transform reconstruído: {transf_cubo}")
 
     # Reprojetar a geometria do polígono para o CRS do cubo (UTM)
     print("  [~] Reprojetando polígono para o CRS do cubo...")
@@ -290,6 +301,10 @@ def main():
     # Isso já é o que precisamos.
 
     mosaic_orig_clipped, mask_orig = clip_to_polygon(mosaico_orig, transf_cubo, geometria_proj)
+    if np.sum(mask_orig) == 0:
+        print("  [!] Máscara original gerou 0 pixels válidos. Salvando mosaico sem máscara.")
+        mosaic_orig_clipped = mosaico_orig.copy()
+        mask_orig = np.ones((mosaic_orig_clipped.shape[1], mosaic_orig_clipped.shape[2]), dtype=bool)
 
     # Transform para o super-resolvido (resolução 4x maior)
     # O FATOR_SR multiplica as dimensões, então os pixels são FATOR_SR vezes menores.
@@ -303,6 +318,10 @@ def main():
     )
 
     mosaic_sr_clipped, mask_sr = clip_to_polygon(mosaico_sr, transf_sr, geometria_proj)
+    if np.sum(mask_sr) == 0:
+        print("  [!] Máscara super-res gerou 0 pixels válidos. Salvando mosaico sem máscara.")
+        mosaic_sr_clipped = mosaico_sr.copy()
+        mask_sr = np.ones((mosaic_sr_clipped.shape[1], mosaic_sr_clipped.shape[2]), dtype=bool)
 
     # 7. Salvar GeoTIFFs originais
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -343,10 +362,11 @@ def main():
 
         # simple_atmo: correção atmosférica visual
         #   haze=0.03 (névoa leve), contrast=3 (típico), bias=0.5 (centro)
-        rgb_enhanced = simple_atmo(rgb_norm, haze=0.03, contrast=3, bias=0.5)
+        rgb_enhanced = simple_atmo(rgb_norm.astype('float64'), haze=0.03, contrast=3, bias=0.5)
 
         # saturation: aumentar saturação em 30%
-        rgb_enhanced = saturation(rgb_enhanced, proportion=1.3)
+        # Nota: nesta instalação, rio-color espera float64 no buffer Cython.
+        rgb_enhanced = saturation(rgb_enhanced.astype('float64'), proportion=1.3)
 
         # Desnormalizar de volta para a escala original (opcional)
         # Mantemos em [0,1] porque é o range correto para visualização
