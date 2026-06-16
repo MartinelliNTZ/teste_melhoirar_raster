@@ -30,9 +30,9 @@ from pyproj import Transformer
 # CONFIGURAÇÕES (centralizadas no início)
 # =============================================================================
 
-VETOR_LIMITE = "vetores/limite2.gpkg"
-START_DATE   = "2025-05-29"
-END_DATE     = "2026-09-08"
+VETOR_LIMITE = "vetores/INTERESSE.gpkg"
+START_DATE   = "2025-06-08"
+END_DATE     = "2026-06-10"
 IMAGE_INDEX  = 0
 
 COLECAO      = "sentinel-2-l2a"
@@ -40,7 +40,7 @@ BANDAS       = ["B04", "B03", "B02", "B08"]
 RESOLUCAO_M  = 10
 FATOR_SR     = 4        # 10m → 2.5m
 TILE_SIZE    = 128
-OUTPUT_DIR   = "resultados5"
+OUTPUT_DIR   = "OURIVES_SR_OUTPUT"
 BLOB_HOST    = "sentinel2l2a01.blob.core.windows.net"
 
 # =============================================================================
