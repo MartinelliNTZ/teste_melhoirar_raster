@@ -25,23 +25,36 @@ from rasterio.crs import CRS
 from rasterio.features import geometry_mask
 from shapely.ops import unary_union
 from pyproj import Transformer
+from datetime import datetime, timedelta
 
 # =============================================================================
 # CONFIGURAÇÕES (centralizadas no início)
 # =============================================================================
 
 VETOR_LIMITE = "vetores/INTERESSE.gpkg"
-START_DATE   = "2025-06-08"
-END_DATE     = "2026-06-10"
-IMAGE_INDEX  = 0
+
+# Data: usamos uma janela móvel curta para evitar timeout do STAC.
+# Em vez de um ano inteiro, tentamos os últimos N dias.
+DIAS_BUSCA = 15            # Janela de busca (dias). Quanto menor, mais rápido.
+IMAGE_INDEX  = -1          # -1 = imagem mais recente
 
 COLECAO      = "sentinel-2-l2a"
 BANDAS       = ["B04", "B03", "B02", "B08"]
-RESOLUCAO_M  = 10
+RESOLUCAO_M  = 
 FATOR_SR     = 4        # 10m → 2.5m
 TILE_SIZE    = 128
 OUTPUT_DIR   = "OURIVES_SR_OUTPUT"
 BLOB_HOST    = "sentinel2l2a01.blob.core.windows.net"
+
+MAX_STAC_ITEMS = 3   # Limite de cenas STAC para evitar timeout
+STAC_RETRIES   = 3   # Tentativas de download
+STAC_DELAY     = 5.0 # Segundos iniciais entre retries
+
+# STAC endpoints alternativos
+STAC_ENDPOINTS = [
+    "https://planetarycomputer.microsoft.com/api/stac/v1",
+    "https://earth-search.aws.element84.com/v1",  # Element84 (AWS, Sentinel-2 L2A)
+]
 
 # =============================================================================
 # VERIFICAÇÕES DE DEPENDÊNCIAS
@@ -100,6 +113,57 @@ def compute_with_retry(da, idx=IMAGE_INDEX, max_tries=5, delay=2.0, backoff=2.0)
                 time.sleep(d)
             else:
                 raise
+
+
+def create_cubo_with_retry(max_tries=STAC_RETRIES, delay=STAC_DELAY, backoff=2.0, **kwargs):
+    """Tenta chamar `cubo.create(...)` com retries exponenciais e fallback entre STACs.
+
+    Força max_items para evitar que o STAC retorne muitas cenas e timeout.
+    Tenta cada endpoint STAC configurado em STAC_ENDPOINTS antes de desistir.
+    """
+    if 'max_items' not in kwargs:
+        kwargs['max_items'] = MAX_STAC_ITEMS
+
+    # Se o usuário passou um stac específico, tenta só ele
+    endpoints = [kwargs.get('stac')] if 'stac' in kwargs else STAC_ENDPOINTS
+
+    ultimo_erro = None
+    for stac_url in endpoints:
+        kwargs['stac'] = stac_url
+        print(f"\n  [~] Tentando STAC: {stac_url}")
+        for attempt in range(1, max_tries + 1):
+            try:
+                return cubo.create(**kwargs)
+            except Exception as e:
+                err_str = str(e)
+                err_lower = err_str.lower()
+                ultimo_erro = e
+
+                if "504" in err_str or "service unavailable" in err_lower or "gateway" in err_lower:
+                    print(f"\n    [!] STAC FORA DO AR (504/Serviço indisponível) - O servidor remoto não está respondendo.")
+                    print(f"    Isso é um problema temporário do provedor, não do script.")
+                    # Pular tentativas restantes e ir para o próximo endpoint
+                    break  # vai para o próximo endpoint
+                elif ("request exceeded" in err_lower or "maximum allowed time" in err_lower
+                        or "timeout" in err_lower or "connection" in err_lower):
+                    print(f"\n    [!] Timeout (tentativa {attempt}/{max_tries}): {stac_url}")
+                else:
+                    print(f"\n    [!] Erro (tentativa {attempt}/{max_tries}): {e}")
+
+                if attempt < max_tries:
+                    d = delay * (backoff ** (attempt - 1))
+                    print(f"    [~] Aguardando {d:.0f}s...")
+                    time.sleep(d)
+
+    print("\n  [!!] Todos os endpoints STAC falharam.")
+    print("    Causas prováveis:")
+    print("      1. Planetary Computer pode estar fora do ar temporariamente (504 Gateway Timeout).")
+    print("      2. Element84 (AWS) pode não ter dados na região/época solicitada.")
+    print("    Sugestões:")
+    print("      - Tente novamente mais tarde (limpeza de cache/provedor).")
+    print("      - Verifique se há dados Sentinel-2 na região em https://planetarycomputer.microsoft.com/dataset/sentinel-2-l2a")
+    print("      - Reduza a área do polígono (menor bbox) ou DIAS_BUSCA.")
+    raise ultimo_erro
 
 
 def save_geotiff(arr, transform, crs, path):
@@ -203,11 +267,34 @@ def main():
     mlstac.download(file=model_url, output_dir=model_dir)
     model = mlstac.load(model_dir).compiled_model(device=device)
 
-    # 4. Baixar cubo
+    # 4. Baixar cubo (com retry, limite de itens STAC, e janela de datas curta)
+    agora = datetime.utcnow()
+    # Janela principal: últimos DIAS_BUSCA dias
+    end_dt = agora
+    start_dt = agora - timedelta(days=DIAS_BUSCA)
+    start_date = start_dt.strftime("%Y-%m-%d")
+    end_date   = end_dt.strftime("%Y-%m-%d")
+
     print(f"\nBaixando cubo S2 ({edge_px}×{edge_px}px, centro {cy:.6f}, {cx:.6f})...")
-    da = cubo.create(lat=cy, lon=cx, collection=COLECAO, bands=BANDAS,
-                     start_date=START_DATE, end_date=END_DATE,
-                     edge_size=edge_px, resolution=RESOLUCAO_M)
+    print(f"  Janela de datas: {start_date} a {end_date} ({DIAS_BUSCA} dias)")
+    print(f"  Limite de cenas STAC: {MAX_STAC_ITEMS}")
+    print(f"  Endpoints STAC: {len(STAC_ENDPOINTS)} disponíveis")
+
+    try:
+        da = create_cubo_with_retry(
+            lat=cy, lon=cx, collection=COLECAO, bands=BANDAS,
+            start_date=start_date, end_date=end_date,
+            edge_size=edge_px, resolution=RESOLUCAO_M,
+        )
+    except Exception:
+        print(f"\n  [!] Falha com janela de {DIAS_BUSCA} dias. Tentando janela menor (7 dias)...")
+        start_dt2 = agora - timedelta(days=7)
+        da = create_cubo_with_retry(
+            lat=cy, lon=cx, collection=COLECAO, bands=BANDAS,
+            start_date=start_dt2.strftime("%Y-%m-%d"),
+            end_date=end_date,
+            edge_size=edge_px, resolution=RESOLUCAO_M,
+        )
 
     crs = da.rio.crs
     # Transform do cubo completo (rio já fornece o transform correto)
